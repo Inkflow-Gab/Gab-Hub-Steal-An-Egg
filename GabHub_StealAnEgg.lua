@@ -15,7 +15,7 @@ if not game then
     error("GabHub: run this inside a Roblox executor, not a plain Lua editor.", 0)
 end
 
-local Hub     = { Version = "2.0.0" }
+local Hub     = { Version = "2.0.1" }
 local SESSION = { connections = {}, instances = {}, dead = false }
 
 -- Re-execution safety: tear down any previous run cleanly ----------------------
@@ -218,6 +218,7 @@ end
 -- Game API  (dynamic discovery + caching)
 --------------------------------------------------------------------------------
 local NetCache = {}
+local RemoteThrottle = 0
 local function getRemote(path)
     if NetCache[path] ~= nil then
         return NetCache[path] or nil
@@ -238,6 +239,12 @@ end
 local function callRemote(path, isEvent, ...)
     local remote = getRemote(path)
     if not remote then return nil end
+    -- Global rate limit: no more than one remote every 0.14s across ALL
+    -- features. Bursting triggers the game's spam detection -> kick.
+    local now = os.clock()
+    local gap = 0.14 - (now - (RemoteThrottle or 0))
+    if gap > 0.001 then task.wait(gap) end
+    RemoteThrottle = os.clock()
     local args = { ... }
     if isEvent then
         local ok = pcall(function()
@@ -249,6 +256,78 @@ local function callRemote(path, isEvent, ...)
         if ok then return result end
         return nil
     end
+end
+
+-- Anti-detection bypass ----------------------------------------------------------
+-- The game ships a client-side detection script that marks players for kicks.
+-- It holds its state (counters/flags) in table upvalues. We find that closure
+-- (identified by its constants -> "gmatch" + "GetFullName" pair scan) and freeze
+-- every table upvalue with a blocked __newindex metatable, so the detector can
+-- never write a verdict.
+local function bypassDetections()
+    local blocked = 0
+    local setMeta = (typeof(setrawmetatable) == "function" and setrawmetatable)
+        or (typeof(setmetatable) == "function" and setmetatable)
+    if not setMeta then return 0, "no setmetatable available" end
+
+    local getUpvalues = debug and type(debug) == "table" and debug.getupvalues
+    if type(getUpvalues) ~= "function" then return 0, "no debug.getupvalues" end
+
+    local found = nil
+
+    -- Fast path: executors with filtergc (Delta has it)
+    if typeof(filtergc) == "function" then
+        local ok, fn = pcall(function()
+            return filtergc("function", { Constants = { "gmatch", "GetFullName" } }, true)
+        end)
+        if ok and type(fn) == "function" then
+            found = fn
+        end
+    end
+
+    -- Slow path: scan the GC for any closure whose constants contain both
+    -- "gmatch" and "GetFullName" (the detector's identity fingerprint).
+    if not found and typeof(getgc) == "function" and typeof(getconstants) == "function" then
+        local ok, objects = pcall(getgc, true)
+        if ok and type(objects) == "table" then
+            for _, obj in ipairs(objects) do
+                if typeof(obj) == "function" and typeof(islclosure) == "function" and islclosure(obj) then
+                    local okC, consts = pcall(getconstants, obj)
+                    if okC and type(consts) == "table" then
+                        local has1, has2 = false, false
+                        for _, c in ipairs(consts) do
+                            if c == "gmatch" then has1 = true end
+                            if c == "GetFullName" then has2 = true end
+                        end
+                        if has1 and has2 then
+                            found = obj
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if not found then
+        return 0, "detector not found (maybe game updated)"
+    end
+
+    local okU, ups = pcall(getUpvalues, found)
+    if not okU or type(ups) ~= "table" then
+        return 0, "no upvalues"
+    end
+    for _, tbl in pairs(ups) do
+        if typeof(tbl) == "table" then
+            local okSet = pcall(setMeta, tbl, {
+                __newindex = function() end,
+            })
+            if okSet then
+                blocked += 1
+            end
+        end
+    end
+    return blocked
 end
 
 local EggStateModule, SaveModule, AssetsModule
@@ -452,6 +531,9 @@ local function stopNavigation()
     local hum = findHumanoid()
     if hum then
         safeCall(function() hum:Move(Vector3.zero, false) end)
+        if OriginalWalkSpeed then
+            safeCall(function() hum.WalkSpeed = OriginalWalkSpeed end)
+        end
     end
 end
 
@@ -460,6 +542,9 @@ local function walkTo(targetPos, speed, timeout)
     local hum = findHumanoid()
     if not hum then return false end
     navigating = true
+    safeCall(function()
+        hum.WalkSpeed = math.max(OriginalWalkSpeed, speed or Config.StealSpeed or 24)
+    end)
     local t0 = os.clock()
     local arrived = false
     while navigating and not SESSION.dead and (not timeout or os.clock() - t0 < timeout) do
@@ -477,9 +562,13 @@ local function walkTo(targetPos, speed, timeout)
         safeCall(function()
             hum:Move(delta.Unit * step / math.max(dt, 1/240), false)
         end)
-        -- Yield; RefreshHumanoidState handled by engine
     end
     navigating = false
+    -- Restore vanilla speed so idle characters never look tampered with
+    safeCall(function()
+        local h = findHumanoid()
+        if h and OriginalWalkSpeed then h.WalkSpeed = OriginalWalkSpeed end
+    end)
     return arrived
 end
 
@@ -491,11 +580,16 @@ local function teleportTo(pos)
 end
 
 --------------------------------------------------------------------------------
--- Character patches (speed / anti-ragdoll)
---------------------------------------------------------------------------------
+-- Character patches (speed / anti-ragdoll) --------------------------------------
+-- Keep the game's own default speed so we can always restore a "vanilla"
+-- look whenever we are not actively navigating (anti-cheat friendly).
+local OriginalWalkSpeed = 16
 local function applyCharacterPatches(humanoid)
     if not humanoid then return end
     safeCall(function()
+        if OriginalWalkSpeed == nil then
+            OriginalWalkSpeed = humanoid.WalkSpeed
+        end
         humanoid.WalkSpeed = Config.WalkSpeed
         humanoid.UseJumpPower = true
         humanoid.JumpPower = Config.JumpPower
@@ -718,6 +812,8 @@ track(RunService.Heartbeat:Connect(function()
     if SESSION.dead or os.clock() % 2 > 0.2 then return end
     local inv = getEggInventory()
     if not inv then return end
+    -- Process at most ONE egg per cycle (round-robin over time) so we never
+    -- burst remote calls -> the fastest legit-looking pace.
     for uid, data in pairs(inv) do
         if type(data) == "table" then
             local _, rank = eggRarityOf(data)
@@ -726,17 +822,13 @@ track(RunService.Heartbeat:Connect(function()
                 safeCall(function()
                     callRemote("RF/EggWorld/AskPlaceEgg", false, { Uid = uid })
                 end)
+                break
             end
             if Config.AutoHatch and data.Placement then
-                local ready = nil
-                if type(data.HatchAt) == "number" then
-                    ready = os.time() >= data.HatchAt
-                end
-                if ready ~= false then
-                    safeCall(function()
-                        callRemote("RF/EggWorld/AskFinishHatch", false, { Uid = uid })
-                    end)
-                end
+                safeCall(function()
+                    callRemote("RF/EggWorld/AskFinishHatch", false, { Uid = uid })
+                end)
+                break
             end
         end
     end
@@ -796,16 +888,10 @@ end
 track(RunService.Heartbeat:Connect(function()
     if SESSION.dead or os.clock() % 2.5 > 0.2 then return end
     if Config.AutoSellEggs then
-        local ok, n = pcall(sellPass)
-        if ok and n and n > 0 then
-            Notify("Sell", ("Sold %d egg(s)."):format(n), "info")
-        end
+        sellPass()
     end
     if Config.AutoSellPets then
-        local ok, n = pcall(sellPetsPass)
-        if ok and n and n > 0 then
-            Notify("Sell", ("Sold %d pet(s)."):format(n), "info")
-        end
+        sellPetsPass()
     end
 end))
 
@@ -1596,6 +1682,14 @@ local function buildPages()
         Hub.SaveConfig()
         Notify("Config", "Saved.", "success")
     end)
+    addButton(Pages.Settings, "Re-run anti-detection bypass", function()
+        local count, why = bypassDetections()
+        if count and count > 0 then
+            Notify("Stealth", ("Bypass applied: %d detector state(s) frozen."):format(count), "success")
+        else
+            Notify("Stealth", "Bypass not applied — " .. tostring(why), "error")
+        end
+    end)
     addButton(Pages.Settings, "Reset to defaults", function()
         local keybind = Config.Keybind
         for key, value in pairs(Defaults) do
@@ -1649,5 +1743,16 @@ buildWindow()
 buildPages()
 selectPage("Main")
 Notify("Gab Hub", ("Loaded v%s — Steal An Egg."):format(Hub.Version), "success")
+
+-- Neutralize the game's client-side detection before any automation can run
+task.spawn(function()
+    task.wait(0.5)
+    local count, why = bypassDetections()
+    if count and count > 0 then
+        Notify("Stealth", ("Anti-detection bypass active (%d frozen)."):format(count), "success")
+    else
+        Notify("Stealth", "Bypass unavailable — " .. tostring(why), "error")
+    end
+end)
 
 return Hub

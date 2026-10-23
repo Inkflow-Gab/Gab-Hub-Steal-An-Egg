@@ -52,5 +52,12 @@ Menu bind: **RightShift** (changeable in the Settings tab).
 - Every network call and loop is pcall-wrapped — one bad response never kills the hub
 - Touch-first GUI (drag works with mouse **and** finger), scales down to small screens automatically
 
+## Anti-kick (v2.0.1)
+
+- **Anti-detection bypass** runs at startup (and can be re-run from Settings): it locates the game's client-side detection closure by its constant fingerprint and freezes its table state so it can never write a kick verdict.
+- **Global remote rate limiter** — no more than ~7 remote calls/second across every feature; place/hatch/sell process at most one item per cycle (round-robin).
+- **Speed discipline** — vanilla WalkSpeed is restored whenever the character is idle; boosted speed is only used while actively navigating.
+- Keep teleport mode OFF for long sessions; it is best reserved for grabbing, not commuting.
+
 ## Disclaimer
 Using third-party scripts/games automation violates Roblox ToS — use an alt account. Not affiliated with Roblox or the game's developers.
