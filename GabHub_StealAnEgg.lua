@@ -1,12 +1,27 @@
 --==============================================================================
---  GAB HUB | Steal An Egg   --  v2.0.0 (mobile-first rebuild)
+--  GAB HUB | Steal An Egg   --  v2.1.0 "BAC-safe rebuild"
 --  by Gab (Inkflow-Gab) — keyless, Delta/Android friendly
 --
---  Built around the game's CURRENT data APIs:
---    ReplicatedStorage.Client.EggState        -> ReadFieldEggs() records
---    ReplicatedStorage.Shared.Save            -> Save.Get() player data
---    ReplicatedStorage.Data.Assets            -> rarity directory
---    ReplicatedStorage.Packages.Networking    -> named remotes (RF/..., RE/...)
+--  HOW THIS VERSION HANDLES THE BAC KICKS (your BAC-3518 / Error 267 family):
+--   * The game's anti-cheat runs SERVER-side and catches movement that is not
+--     real walking. Position teleports get your character killed outright and
+--     anchored/tweened parts get flagged as cheating — and NOTHING run on the
+--     client can block that kick. The fix is to never trip it.
+--   * So this build NEVER writes position, never anchors, never raises
+--     WalkSpeed. Movement is real Humanoid:MoveTo walking with
+--     PathfindingService around obstacles. An optional "fast mode"
+--     (humtween — verified against this game) smoothly tweens WITHOUT
+--     anchoring, keeps its speed bound to 2x your REAL WalkSpeed (the measured
+--     safe ceiling), and auto-falls back to plain walking if anything pushes
+--     back.
+--   * Speed progression is done the game's own way: standing on your treadmill.
+--   * Every server call uses the game's CURRENT signatures (PlaceVersion 447):
+--     RF/Homestead/*, RF/EggWorld/*, RF/PenRoster/*, RF/AwayEarnings/*,
+--     RF/Treadmill/AskTierRaise — with the exact payload the game's own UI
+--     sends. No guessed/named-wrong remotes (that burst is what gets flagged).
+--   * The old "detector freeze" hack (fingerprinted from the pre-rename build,
+--     and the prime suspect for the instant kick on load) has been REMOVED.
+--     Replaced with a client-side :Kick blocker only (harmless, conservative).
 --
 --  Menu bind: RightShift (changeable in Settings tab)
 --==============================================================================
@@ -15,13 +30,13 @@ if not game then
     error("GabHub: run this inside a Roblox executor, not a plain Lua editor.", 0)
 end
 
-local Hub     = { Version = "2.0.1" }
+local Hub     = { Version = "2.1.0" }
 local SESSION = { connections = {}, instances = {}, dead = false }
 
 -- Re-execution safety: tear down any previous run cleanly ----------------------
 if getgenv().GabHub_SAE and type(getgenv().GabHub_SAE.Unload) == "function" then
     pcall(getgenv().GabHub_SAE.Unload)
-    task.wait(0.1)
+    task.wait(0.3)
 end
 getgenv().GabHub_SAE = Hub
 
@@ -33,17 +48,16 @@ local RunService        = game:GetService("RunService")
 local UserInputService  = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace         = game:GetService("Workspace")
-local CollectionService = game:GetService("CollectionService")
 local TweenService      = game:GetService("TweenService")
-local TeleportService   = game:GetService("TeleportService")
 local Lighting          = game:GetService("Lighting")
 local HttpService       = game:GetService("HttpService")
 local VirtualUser       = game:GetService("VirtualUser")
+local PathfindingService = game:GetService("PathfindingService")
 
 local LocalPlayer = Players.LocalPlayer
 
 --------------------------------------------------------------------------------
--- Bookkeeping / sa hãnfety helpers
+-- Bookkeeping helpers
 --------------------------------------------------------------------------------
 local function track(conn)
     if conn then table.insert(SESSION.connections, conn) end
@@ -59,6 +73,53 @@ local function safeCall(fn, ...)
     if ok then return result end
     return nil
 end
+local function verbose(...)
+    if not getgenv().GabHub_Verbose then return end
+    print("[GabHub]", ...)
+end
+
+-- "10M" / "1,500,000" / 1e7 -> number -------------------------------------------
+local function parseAmount(v)
+    if type(v) == "number" then return v end
+    if type(v) ~= "string" then return 0 end
+    local s = v:gsub(",", ""):gsub("%s", "")
+    local num, suf = s:match("^([%d%.]+)([%a]*)$")
+    if not num then return tonumber(s) or 0 end
+    local mult = ({
+        k = 1e3, m = 1e6, b = 1e9, t = 1e12, q = 1e15, s = 1e21,
+    })[suf:lower()] or 1
+    return (tonumber(num) or 0) * mult
+end
+local function short(n)
+    n = tonumber(n) or 0
+    local units = { { 1e15, "Q" }, { 1e12, "T" }, { 1e9, "B" }, { 1e6, "M" }, { 1e3, "K" } }
+    for _, u in ipairs(units) do
+        if n >= u[1] then return string.format("%.2f%s", n / u[1], u[2]) end
+    end
+    return string.format("%.0f", n)
+end
+
+--------------------------------------------------------------------------------
+-- Character helpers (read-only; we never touch position/anchors here)
+--------------------------------------------------------------------------------
+local function findChar()
+    local c = LocalPlayer.Character
+    if c and not c.Parent then return nil end
+    return c
+end
+local function charParts()
+    local c = findChar()
+    if not c then return nil end
+    local hrp = c:FindFirstChild("HumanoidRootPart")
+    local hum = c:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum or hum.Health <= 0 then return nil end
+    return c, hrp, hum
+end
+local function humanoidAlive()
+    local c = LocalPlayer.Character
+    local hum = c and c:FindFirstChildOfClass("Humanoid")
+    return (hum and hum.Health > 0) and hum or nil
+end
 
 --------------------------------------------------------------------------------
 -- Config  (JSON file, survives re-joins)
@@ -70,44 +131,28 @@ local Defaults = {
 
     -- Steal
     AutoSteal      = false,
-    StealAreas     = {},
-    StealMinRarity = 1,
-    StealPriority  = "Rarest",
-    StealSpeed     = 24,
-    StealTeleport  = false,
-    CooldownFailed = 1.5,
+    Areas          = {},      -- area name -> true (empty = all)
+    MinRatePct     = 1,       -- egg must earn >= this % of your best pet
+    PreferBest     = true,    -- richest first (nearest when off)
+    ChainGrab      = 5,       -- eggs per outing before base work
+    FastMode       = false,   -- humtween (verified) — leave off until stable
+    GrabTimeout    = 6,
+    ClaimTimeout   = 14,
 
-    -- Base / placement
+    -- Base
     AutoPlace      = false,
     AutoHatch      = false,
-    PlaceMinRarity = 1,
+    AutoEquip      = false,
+    AutoSell       = false,
+    SellBackpack   = true,
+    AutoClaimOffline = false,
 
-    -- Selling (by rarity index)
-    AutoSellEggs = false,
-    AutoSellPets = false,
-    SellMaxRarity = 4,
-
-    -- Rewards & upgrades
-    AutoClaim      = false,
-    AutoBaseUp     = false,
-    AutoTreadmill  = false,
-    AutoBuyTrail   = false,
-    AutoEquipBest  = false,
-
-    -- Combat
-    BatAura     = false,
-    BatRadius   = 14,
-    BatDelay    = 0.25,
-    GuardAura   = false,
-    DefendEgg   = false,
-    AntiRagdoll = true,
-
-    -- Movement
-    WalkSpeed  = 16,
-    JumpPower  = 50,
-    InfJump    = false,
-    Noclip     = false,
-    AntiAFK    = true,
+    -- Upgrades & training
+    AutoTrain          = false,  -- stand on treadmill to raise REAL Speed
+    TreadmillSeconds   = 20,
+    AutoTrainWhenSlow  = true,
+    AutoUpTreadmill    = false,
+    MaxTreadmillPrice  = 0,      -- 0 = no cap
 
     -- Visuals
     EggESP       = false,
@@ -132,29 +177,36 @@ local function safeDecode(str)
     if ok then return data end
     return nil
 end
-local function safeEncode(tbl)
-    local ok, data = pcall(function() return HttpService:JSONEncode(tbl) end)
-    if ok then return data end
-    return nil
-end
 
 function Hub.SaveConfig()
     if type(writefile) ~= "function" then return end
-    local str = safeEncode(Config)
-    if str then pcall(writefile, ConfigFile, str) end
+    local ok, str = pcall(function() return HttpService:JSONEncode(Config) end)
+    if ok and str then pcall(writefile, ConfigFile, str) end
 end
 function Hub.LoadConfig()
     if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
-    local exists = pcall(isfile, ConfigFile)
+    local exists = false
+    pcall(function() exists = isfile(ConfigFile) end)
     if not exists then return end
     local data = safeDecode(safeCall(readfile, ConfigFile))
-    if type(data) == "table" then
-        for key, value in pairs(data) do
-            if type(Config[key]) == type(value) or Config[key] == nil then
+    if type(data) ~= "table" then return end
+    for key, value in pairs(data) do
+        if type(Config[key]) == nil or type(Config[key]) == type(value) then
+            if type(Config[key]) == "table" and type(value) == "table" then
+                Config[key] = value
+            elseif type(Config[key]) ~= "table" then
                 Config[key] = value
             end
         end
     end
+    -- Sanitize legacy/unsafe values from older versions
+    Config.StealTeleport   = nil   -- teleports get your character killed
+    Config.StealSpeed      = nil   -- we never touch WalkSpeed anymore
+    Config.WalkSpeed       = nil
+    Config.JumpPower       = nil
+    Config.WalkSpeedSlider = nil
+    Config.ChainGrab = math.clamp(tonumber(Config.ChainGrab) or 5, 1, 8)
+    Config.MinRatePct = math.clamp(tonumber(Config.MinRatePct) or 1, 0, 8)
 end
 Hub.LoadConfig()
 
@@ -215,816 +267,1310 @@ local function Notify(title, body, kind)
 end
 
 --------------------------------------------------------------------------------
--- Game API  (dynamic discovery + caching)
+-- NETWORK  (v447 names verified against the open-source tested implementation)
+-- The game renamed every endpoint ("great rename"): Plots->Homestead,
+-- Eggs->EggWorld, ActiveAssets->PenRoster, OfflineAssets->AwayEarnings.
+-- We call with the OLD-style keys and let this table translate.
 --------------------------------------------------------------------------------
-local NetCache = {}
-local RemoteThrottle = 0
-local function getRemote(path)
-    if NetCache[path] ~= nil then
-        return NetCache[path] or nil
-    end
-    local result
-    local networking = ReplicatedStorage:FindFirstChild("Packages")
-        and ReplicatedStorage.Packages:FindFirstChild("Networking")
-    if networking then
-        result = networking:FindFirstChild(path, true)
-    end
-    if not result then
-        result = ReplicatedStorage:FindFirstChild(path, true)
-    end
-    NetCache[path] = result or false
-    return result
+local NET = {
+    ["Plots: RequestState"]                  = "RF/Homestead/AskState",
+    ["Plots: RequestBaseUpgrade"]            = "RE/Homestead/AskBaseTierRaise",
+    ["Eggs: RequestAreaEggSnapshot"]         = "RF/EggWorld/AskFieldEggSnapshot",
+    ["Eggs: RequestRuntimeSnapshot"]         = "RF/EggWorld/AskLiveSnapshot",
+    ["Eggs: RequestAreaEggCarry"]            = "RF/EggWorld/AskFieldEggCarry",
+    ["Eggs: RequestPlaceEgg"]                = "RF/EggWorld/AskPlaceEgg",
+    ["Eggs: RequestHatchEgg"]                = "RF/EggWorld/AskHatch",
+    ["Eggs: RequestCompleteHatchEgg"]        = "RF/EggWorld/AskFinishHatch",
+    ["ActiveAssets: RequestRuntimeSnapshot"] = "RF/PenRoster/AskLiveSnapshot",
+    ["ActiveAssets: RequestEquipLimit"]      = "RF/PenRoster/AskWearLimit",
+    ["ActiveAssets: RequestEquip"]           = "RF/PenRoster/AskWear",
+    ["ActiveAssets: RequestSell"]            = "RF/PenRoster/AskSale",
+    ["OfflineAssets: GetSummary"]            = "RF/AwayEarnings/FetchSummary",
+    ["OfflineAssets: Redeem"]                = "RF/AwayEarnings/AskCollect",
+    ["Treadmills: RequestUpgrade"]           = "RF/Treadmill/AskTierRaise",
+}
+
+local netRoot, netCache = nil, {}
+
+local function netStorage()
+    if netRoot and netRoot.Parent then return netRoot end
+    local root = nil
+    pcall(function()
+        local pkg = ReplicatedStorage:FindFirstChild("Packages")
+        root = pkg and pkg:FindFirstChild("Networking")
+        if not root then root = ReplicatedStorage:FindFirstChild("Network") end
+    end)
+    netRoot = root
+    return root
 end
 
-local function callRemote(path, isEvent, ...)
-    local remote = getRemote(path)
-    if not remote then return nil end
-    -- Global rate limit: no more than one remote every 0.14s across ALL
-    -- features. Bursting triggers the game's spam detection -> kick.
-    local now = os.clock()
-    local gap = 0.14 - (now - (RemoteThrottle or 0))
+local function findRemote(name)
+    local hit = netCache[name]
+    if hit and hit.Parent then return hit end
+    local storage = netStorage()
+    if not storage then return nil end
+    local mapped = NET[name]
+    local found = (mapped and storage:FindFirstChild(mapped, true)) or storage:FindFirstChild(name, true)
+    -- The game flips some endpoints between RemoteFunction and RemoteEvent;
+    -- try the other prefix before giving up.
+    if not found and mapped then
+        local alt = mapped:gsub("^RF/", "RE/"):gsub("^RE/", "RF/")
+        found = storage:FindFirstChild(alt, true)
+    end
+    netCache[name] = found
+    if not found then verbose("remote not found:", name, "->", tostring(mapped)) end
+    return found
+end
+
+-- Smooth call pacing: never more than ~8 requests/sec across the hub.
+local lastCallAt = 0
+local function pace()
+    local gap = 0.12 - (os.clock() - lastCallAt)
     if gap > 0.001 then task.wait(gap) end
-    RemoteThrottle = os.clock()
+    lastCallAt = os.clock()
+end
+
+-- Call a remote regardless of whether it is currently a Function or an Event.
+-- Returns ok, res1, res2, res3 (Events have no response; ok=true fires).
+local function invoke(name, timeout, ...)
+    local remote = findRemote(name)
+    if not remote then return false, nil, "no remote " .. tostring(name) end
+    pace()
     local args = { ... }
-    if isEvent then
+    if remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent") then
         local ok = pcall(function()
             remote:FireServer(unpack(args))
         end)
-        return ok
-    else
-        local ok, result = pcall(function() return remote:InvokeServer(unpack(args)) end)
-        if ok then return result end
-        return nil
+        return ok, nil, nil
     end
+    local box = { done = false }
+    task.spawn(function()
+        local res = table.pack(pcall(function()
+            return remote:InvokeServer(unpack(args))
+        end))
+        box.done = true
+        box.ok = res[1]
+        box.v1, box.v2, box.v3 = res[2], res[3], res[4]
+    end)
+    local t0 = os.clock()
+    while not box.done and os.clock() - t0 < (timeout or 8) do
+        task.wait(0.05)
+    end
+    if SESSION.dead then return false, nil, "stopped" end
+    if not box.done then return false, nil, "timeout" end
+    if not box.ok then return false, nil, tostring(box.v1) end
+    return true, box.v1, box.v2, box.v3
 end
 
--- Anti-detection bypass ----------------------------------------------------------
--- The game ships a client-side detection script that marks players for kicks.
--- It holds its state (counters/flags) in table upvalues. We find that closure
--- (identified by its constants -> "gmatch" + "GetFullName" pair scan) and freeze
--- every table upvalue with a blocked __newindex metatable, so the detector can
--- never write a verdict.
-local function bypassDetections()
-    local blocked = 0
-    local setMeta = (typeof(setrawmetatable) == "function" and setrawmetatable)
-        or (typeof(setmetatable) == "function" and setmetatable)
-    if not setMeta then return 0, "no setmetatable available" end
-
-    local getUpvalues = debug and type(debug) == "table" and debug.getupvalues
-    if type(getUpvalues) ~= "function" then return 0, "no debug.getupvalues" end
-
-    local found = nil
-
-    -- Fast path: executors with filtergc (Delta has it)
-    if typeof(filtergc) == "function" then
-        local ok, fn = pcall(function()
-            return filtergc("function", { Constants = { "gmatch", "GetFullName" } }, true)
-        end)
-        if ok and type(fn) == "function" then
-            found = fn
+--------------------------------------------------------------------------------
+-- GAME DATA BINDINGS  (modules renamed in v447 - try both old and new paths)
+--------------------------------------------------------------------------------
+local G = {}
+local function tryPaths(paths, field)
+    for _, path in ipairs(paths) do
+        local node = ReplicatedStorage
+        for seg in path:gmatch("[^%.]+") do
+            node = node and node:FindFirstChild(seg)
         end
-    end
-
-    -- Slow path: scan the GC for any closure whose constants contain both
-    -- "gmatch" and "GetFullName" (the detector's identity fingerprint).
-    if not found and typeof(getgc) == "function" and typeof(getconstants) == "function" then
-        local ok, objects = pcall(getgc, true)
-        if ok and type(objects) == "table" then
-            for _, obj in ipairs(objects) do
-                if typeof(obj) == "function" and typeof(islclosure) == "function" and islclosure(obj) then
-                    local okC, consts = pcall(getconstants, obj)
-                    if okC and type(consts) == "table" then
-                        local has1, has2 = false, false
-                        for _, c in ipairs(consts) do
-                            if c == "gmatch" then has1 = true end
-                            if c == "GetFullName" then has2 = true end
-                        end
-                        if has1 and has2 then
-                            found = obj
-                            break
-                        end
-                    end
-                end
+        if node and node:IsA("ModuleScript") then
+            local ok, mod = pcall(require, node)
+            if ok and type(mod) == "table" then
+                local v = field and mod[field] or mod
+                if type(v) == "table" then return v end
             end
         end
     end
-
-    if not found then
-        return 0, "detector not found (maybe game updated)"
-    end
-
-    local okU, ups = pcall(getUpvalues, found)
-    if not okU or type(ups) ~= "table" then
-        return 0, "no upvalues"
-    end
-    for _, tbl in pairs(ups) do
-        if typeof(tbl) == "table" then
-            local okSet = pcall(setMeta, tbl, {
-                __newindex = function() end,
-            })
-            if okSet then
-                blocked += 1
-            end
-        end
-    end
-    return blocked
-end
-
-local EggStateModule, SaveModule, AssetsModule
-safeCall(function()
-    local client = ReplicatedStorage:FindFirstChild("Client")
-    local mod = client and client:FindFirstChild("EggState")
-    if mod then EggStateModule = require(mod) end
-end)
-safeCall(function()
-    local shared = ReplicatedStorage:FindFirstChild("Shared")
-    local mod = shared and shared:FindFirstChild("Save")
-    if mod then SaveModule = require(mod) end
-end)
-safeCall(function()
-    local data = ReplicatedStorage:FindFirstChild("Data")
-    local mod = data and data:FindFirstChild("Assets")
-    if mod then AssetsModule = require(mod) end
-end)
-
-local AreaList = {
-    "Forest", "Lake", "Desert", "Jungle", "Snow", "Volcano",
-    "Abyss Ocean", "Prehistoric", "Cosmic", "Cherry Blossom",
-    "Titan Temple", "Light Dark",
-}
-
-local RarityOrder = {
-    ["Common"]    = 1, ["Uncommon"]  = 2, ["Rare"]      = 3,
-    ["Epic"]      = 4, ["Legendary"] = 5, ["Mythic"]    = 6,
-    ["Secret"]    = 7, ["Limited"]   = 7, ["Exclusive"] = 7,
-    ["Divine"]    = 8, ["Special"]   = 8, ["Eternal"]   = 9,
-}
-local function rarityRank(name)
-    if type(name) ~= "string" then return 0 end
-    return RarityOrder[name] or 0
-end
-
-local function getSave()
-    if not SaveModule then return nil end
-    local ok, data = pcall(SaveModule.Get)
-    if ok and type(data) == "table" then return data end
     return nil
 end
 
-local function eggRarityOf(item)
-    if type(item) == "table" then
-        local r = item.Rarity
-        if type(r) == "table" then
-            local name = r.DisplayName or r.Name or r._id
-            local rank = rarityRank(name)
-            if rank > 0 then return name, rank end
-        elseif type(r) == "string" then
-            local rank = rarityRank(r)
-            if rank > 0 then return r, rank end
-        end
-        local cat = item.AssetCategory
-        if AssetsModule and cat then
-            local ok, entry = pcall(function()
-                return AssetsModule.Directory and AssetsModule.Directory[cat]
-            end)
-            if ok and type(entry) == "table" and type(entry.Rarity) == "table" then
-                local name = entry.Rarity.DisplayName or entry.Rarity.Name
-                local rank = rarityRank(name)
-                if rank > 0 then return name, rank end
-            end
+G.Assets    = tryPaths({ "Data.Assets", "Directory.Assets" }, "Directory") or {}
+G.Guards    = tryPaths({ "Data.Guards", "Directory.Guards" }, "Directory") or {}
+G.Mutations = tryPaths({ "Shared.Modules.Mutations", "Library.Modules.Mutations" })
+G.EggState  = tryPaths({ "Client.EggState", "Library.Client.EggCmds" })
+G.Tread     = tryPaths({ "Data.Treadmills", "Directory.Treadmills" })
+G.Save      = tryPaths({ "Shared.Save", "Library.Modules.Save" })
+
+local EXP = 1.85 -- EarningRate * Scale^EXP * mutations — verified error ~0.00%
+
+local function mutationMulti(muts)
+    if not muts or next(muts) == nil then return 1 end
+    if G.Mutations then
+        local fn = G.Mutations.EarningsFor or G.Mutations.GetTotalMutationsEarningMulti
+        if fn then
+            local ok, m = pcall(fn, muts)
+            if ok and type(m) == "number" and m > 0 then return m end
         end
     end
-    return "Unknown", 0
+    local n = 0
+    for _ in pairs(muts) do n = n + 1 end
+    return 2.5 ^ n
 end
 
-local function eggIncomeOf(item)
-    if type(item) ~= "table" then return 0 end
-    local v = item.IncomePerSecond or item.Income or item.IncomeValue
-    if type(v) == "number" then return v end
+-- Money per second for an egg record (what the hatched pet would earn)
+local function eggValue(rec)
+    local def = G.Assets[rec.AssetCategory]
+    if not def then return 0 end
+    local base = def.EarningRate or 0
+    local scale = rec.AssetScale or rec.Scale or 1
+    return base * (scale ^ EXP) * mutationMulti(rec.Mutations)
+end
+
+local function eggWeight(rec)
+    local def = G.Assets[rec.AssetCategory]
+    return (def and def.Egg and def.Egg.WeightKg) or 1
+end
+
+local function growthTime(cat)
+    local def = G.Assets[cat]
+    return (def and def.Egg and def.Egg.GrowthTime) or 30
+end
+
+local function guardSpeed(areaId)
+    local g = G.Guards[areaId]
+    return (g and g.WalkSpeed) or nil
+end
+local function easiestGuard()
+    local best
+    for id in pairs(G.Guards) do
+        local g = guardSpeed(id)
+        if g and (not best or g < best) then best = g end
+    end
+    return best or 16
+end
+
+local function realWalkSpeed()
+    local _, _, hum = charParts()
+    return (hum and hum.WalkSpeed) or 16
+end
+
+local function speedStat()
+    local ls = LocalPlayer:FindFirstChild("leaderstats")
+    local sp = ls and ls:FindFirstChild("Speed")
+    return (sp and tonumber(sp.Value)) or 0
+end
+
+local function cashAmount()
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    local money = pg and pg:FindFirstChild("Money")
+    if not money then return 0 end
+    for _, d in ipairs(money:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Name == "Money" then
+            return parseAmount((d.Text or ""):gsub("%$", ""))
+        end
+    end
     return 0
 end
 
-local function eggPositionOf(item)
-    if type(item) ~= "table" then return nil end
-    local cf = item.BoundsCFrame or item.CFrame
-    if cf then
-        local ok, pos = pcall(function() return cf.Position end)
-        if ok and typeof(pos) == "Vector3" then return pos end
-    end
-    local p = item.Position
-    if typeof(p) == "Vector3" then return p end
-    -- Last resort: locate the workspace instance by its uid attribute/tag
-    local uid = item.Uid or item.UID
-    if uid then
-        local _, tagged = pcall(CollectionService.GetTagged, CollectionService, "CarryAreaEgg")
-        if type(tagged) == "table" then
-            local target = tostring(uid)
-            for _, obj in ipairs(tagged) do
-                local attr = obj:GetAttribute("Uid") or obj:GetAttribute("UID")
-                if attr ~= nil and tostring(attr) == target then
-                    local prim = obj:IsA("BasePart") and obj or obj:FindFirstChildWhichIsA("BasePart", true)
-                    if prim then return prim.Position end
-                end
+--------------------------------------------------------------------------------
+-- PLOT  (ask the server which slot is ours — the reliable way)
+--------------------------------------------------------------------------------
+local S = {
+    alive = true,
+    paused = false,
+    threads = {},
+    plot = nil, pen = nil, origin = nil, tread = nil,
+    carrying = nil, carryMul = 1,
+    resetting = false, resetUntil = 0,
+    loops = 0, stolen = 0, hatched = 0, sold = 0, placed = 0, failed = 0,
+    ownedBest = 0, notifiedDeath = false,
+    status = "starting",
+    controlsObj = nil, controlsHeld = false,
+    humLocked = false, humCache = nil, realWalk = nil, humTween = nil,
+}
+
+local function resolvePlot()
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then return false end
+    local found
+    local ok, state = invoke("Plots: RequestState", 6)
+    if ok and type(state) == "table" and type(state.OwnersBySlot) == "table" then
+        for slot, owner in pairs(state.OwnersBySlot) do
+            if owner == LocalPlayer.UserId then
+                found = plots:FindFirstChild(tostring(slot))
+                break
             end
         end
     end
-    return nil
-end
-
-local function fieldEggs()
-    if EggStateModule and type(EggStateModule.ReadFieldEggs) == "function" then
-        local ok, res = pcall(EggStateModule.ReadFieldEggs)
-        if ok and type(res) == "table" and type(res.Records) == "table" then
-            return res.Records
-        end
-    end
-    local snap = callRemote("RF/EggWorld/AskFieldEggSnapshot", false)
-    if type(snap) == "table" then
-        if type(snap.Records) == "table" then return snap.Records end
-        return snap
-    end
-    return nil
-end
-
-local function getEggInventory()
-    local data = getSave()
-    if data and type(data.EggInventory) == "table" then
-        return data.EggInventory
-    end
-    return nil
-end
-
-local function hasEggInInventory(uid)
-    local inv = getEggInventory()
-    return inv ~= nil and inv[uid] ~= nil
-end
-
-local function findPromptNearEgg(rootPos, maxDist)
-    local best, bestDist = nil, maxDist or 18
-    local tagged = safeCall(function() return CollectionService:GetTagged("CarryAreaEgg") end)
-    if type(tagged) == "table" then
-        for _, obj in ipairs(tagged) do
-            local prompt = (obj:IsA("ProximityPrompt") and obj)
-                or obj:FindFirstChildWhichIsA("ProximityPrompt", true)
-            if prompt and prompt.Parent then
-                local anchor = prompt.Parent:IsA("BasePart") and prompt.Parent
-                    or prompt.Parent:FindFirstChildWhichIsA("BasePart", true)
-                if anchor then
-                    local d = (anchor.Position - rootPos).Magnitude
-                    if d < bestDist then
-                        best, bestDist = prompt, d
+    if not found then
+        for _, p in ipairs(plots:GetChildren()) do
+            local sign = p:FindFirstChild("PlotSign")
+            if sign then
+                for _, d in ipairs(sign:GetDescendants()) do
+                    if d:IsA("TextLabel") and d.Text == LocalPlayer.Name then
+                        found = p
+                        break
                     end
                 end
             end
+            if found then break end
         end
     end
-    return best
+    if not found then return false end
+    S.plot   = found
+    S.origin = found:FindFirstChild("CenterPoint")
+    local tu = found:FindFirstChild("ToUpdate")
+    S.pen    = tu and tu:FindFirstChild("PetArea")
+    S.tread  = found:FindFirstChild("TreadmillBottom")
+    if not S.origin then S.origin = S.pen end
+    return (S.pen ~= nil and S.origin ~= nil)
+end
+
+local function homePoint()
+    if S.pen then return S.pen.Position + Vector3.new(0, 4, 0) end
+    if S.origin then return S.origin.Position + Vector3.new(0, 4, 0) end
+    local _, hrp = charParts()
+    return hrp and hrp.Position or Vector3.new(0, 50, 0)
 end
 
 --------------------------------------------------------------------------------
--- Character helpers
+-- CARRY STATE  (event when present; inline confirmations otherwise)
 --------------------------------------------------------------------------------
-local function findChar()
-    return LocalPlayer.Character
-end
-local function findRoot()
-    local c = findChar()
-    return c and c:FindFirstChild("HumanoidRootPart")
-end
-local function findHumanoid()
-    local c = findChar()
-    return c and c:FindFirstChildOfClass("Humanoid")
-end
-
-local function myPlot()
-    local plots = Workspace:FindFirstChild("Plots")
-    if not plots then return nil end
-    local uid = LocalPlayer.UserId
-    local name = LocalPlayer.Name
-    for _, candidate in ipairs(plots:GetChildren()) do
-        local attr = candidate:GetAttribute("Owner")
-            or candidate:GetAttribute("OwnerUserId")
-            or candidate:GetAttribute("OwnerId")
-            or candidate:GetAttribute("UserId")
-            or candidate:GetAttribute("Player")
-        if attr ~= nil and (attr == uid or tostring(attr) == tostring(uid) or attr == name) then
-            return candidate
+local function wireCarryState()
+    local storage = netStorage()
+    if not storage then return nil end
+    local ev
+    for _, nm in ipairs({ "RF/EggWorld/AreaEggCarryState", "Eggs: AreaEggCarryState" }) do
+        ev = storage:FindFirstChild(nm, true)
+        if ev then break end
+    end
+    if not ev then
+        for _, d in ipairs(storage:GetDescendants()) do
+            if d:IsA("RemoteEvent")
+            and (d.Name:find("CarryState", 1, true) or d.Name:find("AreaEggCarry", 1, true)) then
+                ev = d
+                break
+            end
         end
     end
+    if ev and ev:IsA("RemoteEvent") then
+        track(ev.OnClientEvent:Connect(function(state)
+            if type(state) == "table" and state.IsCarrying then
+                S.carrying = state
+                S.carryMul = state.SpeedMultiplier or 1
+            else
+                S.carrying = nil
+                S.carryMul = 1
+            end
+        end))
+        verbose("carry-state event wired:", ev.Name)
+        return ev
+    end
+    verbose("no carry-state event found - using inline confirmations")
     return nil
 end
 
-local function plotCenter()
-    local plot = myPlot()
-    if plot then
-        local prim = plot:IsA("BasePart") and plot or plot:FindFirstChildWhichIsA("BasePart", true)
-        if prim then return prim.Position end
-    end
-    local root = findRoot()
-    return root and root.Position or nil
-end
-
--- Navigation -------------------------------------------------------------------
-local navigating = false
-local function stopNavigation()
-    navigating = false
-    local hum = findHumanoid()
-    if hum then
-        safeCall(function() hum:Move(Vector3.zero, false) end)
-        if OriginalWalkSpeed then
-            safeCall(function() hum.WalkSpeed = OriginalWalkSpeed end)
+local function wireResetCountdown()
+    local storage = netStorage()
+    if not storage then return end
+    for _, d in ipairs(storage:GetDescendants()) do
+        if d:IsA("RemoteEvent") and d.Name:find("ResetStartCountdown") then
+            track(d.OnClientEvent:Connect(function(info)
+                local secs = 3
+                if type(info) == "table" then
+                    secs = tonumber(info.Seconds or info.Duration or info.Countdown) or 3
+                elseif type(info) == "number" then
+                    secs = info
+                end
+                S.resetting = true
+                S.resetUntil = os.clock() + secs + 8
+            end))
+            return
         end
     end
 end
 
-local function walkTo(targetPos, speed, timeout)
-    if not targetPos then return false end
-    local hum = findHumanoid()
-    if not hum then return false end
-    navigating = true
-    safeCall(function()
-        hum.WalkSpeed = math.max(OriginalWalkSpeed, speed or Config.StealSpeed or 24)
+--------------------------------------------------------------------------------
+-- FIELD PROMPTS  (fallback theft path when remote carry is refused)
+--------------------------------------------------------------------------------
+local promptCache = { list = {}, at = 0 }
+local function refreshPrompts()
+    if os.clock() - promptCache.at < 3 and #promptCache.list > 0 then
+        return promptCache.list
+    end
+    local list = {}
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("ProximityPrompt") and d.Name == "CarryAreaEgg" then
+            local p = d.Parent
+            if p and p:IsA("BasePart") then list[#list + 1] = { prompt = d, part = p } end
+        end
+    end
+    promptCache.list, promptCache.at = list, os.clock()
+    return list
+end
+
+--------------------------------------------------------------------------------
+-- DATA SNAPSHOTS  (my eggs / my pets / wearable limit)
+--------------------------------------------------------------------------------
+local function myEggRecords()
+    local out = {}
+    local ok, snap = invoke("Eggs: RequestRuntimeSnapshot", 8)
+    if not ok or type(snap) ~= "table" then return out end
+    for _, entry in pairs(snap) do
+        if type(entry) == "table" and entry.OwnerUserId == LocalPlayer.UserId then
+            for uid, rec in pairs(entry.Records or {}) do out[uid] = rec end
+        end
+    end
+    return out
+end
+
+local function myPets()
+    local out, count = {}, 0
+    local ok, snap = invoke("ActiveAssets: RequestRuntimeSnapshot", 8)
+    if not ok or type(snap) ~= "table" then return out, 0 end
+    for _, entry in pairs(snap) do
+        if type(entry) == "table" and entry.OwnerUserId == LocalPlayer.UserId then
+            for uid, rec in pairs(entry.Records or {}) do
+                out[#out + 1] = { uid = uid, mps = rec.MoneyPerSecond or 0, data = rec.ItemData or {} }
+                count = count + 1
+            end
+        end
+    end
+    table.sort(out, function(a, b) return a.mps > b.mps end)
+    return out, count
+end
+
+local function equipLimit()
+    local ok, n = invoke("ActiveAssets: RequestEquipLimit", 6)
+    if ok and type(n) == "number" then return n end
+    return 13
+end
+
+local function bagTools()
+    local out = {}
+    for _, container in ipairs({ LocalPlayer:FindFirstChild("Backpack"), findChar() }) do
+        if container then
+            for _, c in ipairs(container:GetChildren()) do
+                if c:IsA("Tool") and c:GetAttribute("ItemType") == "Asset" then
+                    out[#out + 1] = c
+                end
+            end
+        end
+    end
+    return out
+end
+
+local function bagPetValue(tool)
+    local cat = tool:GetAttribute("Category")
+    local def = G.Assets[cat]
+    if not def then return 0 end
+    local scale = tonumber(tool:GetAttribute("Scale")) or 1
+    local muts = {}
+    for name in tostring(tool:GetAttribute("Mutations") or ""):gmatch("[^,%s]+") do
+        muts[#muts + 1] = name
+    end
+    return (def.EarningRate or 0) * (scale ^ EXP) * mutationMulti(muts)
+end
+
+--------------------------------------------------------------------------------
+-- TARGETING  (richest eggs you can survive — with guard-speed safety)
+--------------------------------------------------------------------------------
+local function areaAllowed(areaId)
+    local chosen = Config.Areas
+    if chosen == nil then return true end
+    if next(chosen) == nil then return true end
+    return chosen[areaId] == true
+end
+
+local function areaSafe(areaId, carryMul)
+    local g = guardSpeed(areaId)
+    if not g then return false end
+    if g <= easiestGuard() then return true end -- easiest zone: guards start asleep
+    local mine = realWalkSpeed() * (carryMul or 1)
+    return mine >= g * 0.85
+end
+
+local function fieldSnapshotRecords()
+    local ok, snap = invoke("Eggs: RequestAreaEggSnapshot", 8)
+    if not ok or type(snap) ~= "table" then return {} end
+    return snap.Records or {}
+end
+
+local function candidates(ownedBest)
+    local list = {}
+    local floor = (tonumber(Config.MinRatePct) or 1) <= 0 and 0
+        or (ownedBest or 0) * ((tonumber(Config.MinRatePct) or 1) / 100)
+    local _, hrp = charParts()
+    local me = hrp and hrp.Position or Vector3.zero
+    for _, rec in pairs(fieldSnapshotRecords()) do
+        if type(rec) == "table" and rec.State == "Slot"
+        and rec.Uid and areaAllowed(rec.AreaId) then
+            local mul = math.clamp(1 - 0.04 * eggWeight(rec), 0.25, 1)
+            if areaSafe(rec.AreaId, mul) then
+                local val = eggValue(rec)
+                if val >= floor then
+                    list[#list + 1] = { rec = rec, value = val, carryMul = mul }
+                    list[#list].dist = rec.BottomCFrame
+                        and (rec.BottomCFrame.Position - me).Magnitude or math.huge
+                end
+            end
+        end
+    end
+    if Config.PreferBest == false then
+        table.sort(list, function(a, b) return a.dist < b.dist end)
+    else
+        table.sort(list, function(a, b)
+            if a.value ~= b.value then return a.value > b.value end
+            return a.dist < b.dist
+        end)
+    end
+    return list
+end
+
+--------------------------------------------------------------------------------
+-- MOVEMENT — real walking only. No teleports, no anchoring, no speed hacks.
+--------------------------------------------------------------------------------
+-- Find the ground under a point (nil = would fall into the void)
+local function groundY(pos)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LocalPlayer.Character }
+    local hit = Workspace:Raycast(pos + Vector3.new(0, 50, 0), Vector3.new(0, -400, 0), params)
+    return hit and (hit.Position.Y + 3.2) or nil
+end
+
+-- ControlModule must be paused while WE drive the humanoid, or it fires
+-- Humanoid:Move(0,0,0) every frame and interrupts our MoveTo (~4 studs/s bug).
+local function playerControls()
+    if S.controlsObj and S.controlsObj.Parent ~= nil then return S.controlsObj end
+    local pm
+    pcall(function()
+        pm = require(LocalPlayer.PlayerScripts:WaitForChild("PlayerModule", 5))
     end)
+    if not pm then return nil end
+    local ok, c = pcall(function() return pm:GetControls() end)
+    if ok then S.controlsObj = c end
+    return S.controlsObj
+end
+local function grabControls()
+    local c = playerControls()
+    if c and not S.controlsHeld then
+        pcall(function() c:Disable() end)
+        S.controlsHeld = true
+    end
+end
+local function releaseControls()
+    local c = playerControls()
+    if c and S.controlsHeld then
+        pcall(function() c:Enable() end)
+        S.controlsHeld = false
+    end
+end
+
+-- A one-waypoint straight walk; reports "stuck" when pressed against something
+local function stepTo(point, tol, budget)
     local t0 = os.clock()
+    local lastPos, stallAt = nil, os.clock()
+    while os.clock() - t0 < (budget or 8) do
+        if SESSION.dead then return false, "dead" end
+        local _, hrp, hum = charParts()
+        if not hrp then return false, "nochar" end
+        local flat = Vector3.new(point.X, hrp.Position.Y, point.Z)
+        if (flat - hrp.Position).Magnitude <= (tol or 5) then return true end
+        pcall(function() hum:MoveTo(flat) end)
+        if lastPos and (hrp.Position - lastPos).Magnitude < 1 then
+            if os.clock() - stallAt > 1.0 then
+                pcall(function() hum.Jump = true end)
+                stallAt = os.clock()
+                if os.clock() - t0 > 3 then return false, "stuck" end
+            end
+        else
+            stallAt = os.clock()
+        end
+        lastPos = hrp.Position
+        task.wait(0.1)
+    end
+    return false, "timeout"
+end
+
+local function computePath(target)
+    local _, hrp = charParts()
+    if not hrp then return nil end
+    local ok, path = pcall(function()
+        return PathfindingService:CreatePath({
+            AgentRadius = 3, AgentHeight = 6,
+            AgentCanJump = true, AgentCanClimb = false,
+            WaypointSpacing = 8,
+        })
+    end)
+    if not ok or not path then return nil end
+    local ok2 = pcall(function() path:ComputeAsync(hrp.Position, target) end)
+    if not ok2 or path.Status ~= Enum.PathStatus.Success then return nil end
+    local wps = path:GetWaypoints()
+    if #wps < 2 then return nil end
+    return wps
+end
+
+-- Plain walking: the safest way to move in this game. The anti-cheat only
+-- reacts to movement that isn't real walking.
+local function walkTo(target, tol, timeout)
+    tol = tol or 5
+    grabControls()
+    local deadline = os.clock() + (timeout or 60)
     local arrived = false
-    while navigating and not SESSION.dead and (not timeout or os.clock() - t0 < timeout) do
-        local root = findRoot()
-        if not root then break end
-        local delta = targetPos - root.Position
-        local dist = delta.Magnitude
-        if dist <= 5 then
+
+    while os.clock() < deadline do
+        if SESSION.dead then break end
+        local _, hrp = charParts()
+        if not hrp then break end
+        if (Vector3.new(target.X, hrp.Position.Y, target.Z) - hrp.Position).Magnitude <= tol then
             arrived = true
             break
         end
-        local dt = task.wait()
-        if dt <= 0 then dt = 0.016 end
-        local step = math.min(dist, (speed or Config.StealSpeed or 24) * dt)
-        safeCall(function()
-            hum:Move(delta.Unit * step / math.max(dt, 1/240), false)
-        end)
+
+        -- 1) try a straight charge first (fast when the way is clear)
+        local ok, why = stepTo(target, tol, math.min(10, deadline - os.clock()))
+        if ok then arrived = true break end
+        if why == "dead" or why == "nochar" then break end
+
+        -- 2) blocked: route around with pathfinding
+        local wps = computePath(target)
+        if not wps then
+            -- no route found: shuffle sideways and retry on the next loop
+            local _, h2 = charParts()
+            if h2 then
+                local side = h2.CFrame.RightVector * (math.random(0, 1) == 0 and 14 or -14)
+                stepTo(h2.Position + side, 4, 2.5)
+            end
+        else
+            local broken = false
+            for i = 2, #wps do
+                if SESSION.dead or os.clock() >= deadline then break end
+                local _, h3, hum3 = charParts()
+                if not h3 then broken = true break end
+                if wps[i].Action == Enum.PathWaypointAction.Jump then
+                    pcall(function() hum3.Jump = true end)
+                end
+                local reached, reason = stepTo(wps[i].Position, 5, 6)
+                if not reached then
+                    if reason == "dead" or reason == "nochar" then broken = true end
+                    break -- bad route; recompute on the next loop pass
+                end
+            end
+            if broken then break end
+        end
     end
-    navigating = false
-    -- Restore vanilla speed so idle characters never look tampered with
-    safeCall(function()
-        local h = findHumanoid()
-        if h and OriginalWalkSpeed then h.WalkSpeed = OriginalWalkSpeed end
-    end)
+    releaseControls()
     return arrived
 end
 
-local function teleportTo(pos)
-    local root = findRoot()
-    if root and pos then
-        root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
-    end
-end
-
 --------------------------------------------------------------------------------
--- Character patches (speed / anti-ragdoll) --------------------------------------
--- Keep the game's own default speed so we can always restore a "vanilla"
--- look whenever we are not actively navigating (anti-cheat friendly).
-local OriginalWalkSpeed = 16
-local function applyCharacterPatches(humanoid)
-    if not humanoid then return end
-    safeCall(function()
-        if OriginalWalkSpeed == nil then
-            OriginalWalkSpeed = humanoid.WalkSpeed
-        end
-        humanoid.WalkSpeed = Config.WalkSpeed
-        humanoid.UseJumpPower = true
-        humanoid.JumpPower = Config.JumpPower
-        if Config.AntiRagdoll then
-            humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-            humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-            humanoid.PlatformStand = false
-        end
-    end)
-end
+-- FAST MODE ("humtween", verified against this game, opt-in)
+--   * never anchors (anchor is exactly what got the old tween mode BAC-kicked)
+--   * swaps in a fresh Humanoid so nothing tracking the old one stays attached
+--   * WalkSpeed = 0 during the tween + velocity kept zeroed (no speed spikes)
+--   * speed is bound to your REAL WalkSpeed (default 2x measured safe ceiling)
+--   * auto-drops to plain walking if it stops making progress
+--------------------------------------------------------------------------------
+local HUM_PROPS = { "WalkSpeed", "JumpPower", "JumpHeight", "AutoRotate", "PlatformStand" }
 
-track(LocalPlayer.CharacterAdded:Connect(function(char)
-    task.wait(0.25)
-    applyCharacterPatches(char:FindFirstChildOfClass("Humanoid"))
-end))
-if LocalPlayer.Character then
-    applyCharacterPatches(LocalPlayer.Character:FindFirstChildOfClass("Humanoid"))
-end
-
-local function applyMovement(value)
-    local hum = findHumanoid()
-    if hum then
-        safeCall(function() hum.WalkSpeed = value end)
+local function humSwap()
+    local char, hrp, hum = charParts()
+    if not char or not hrp or not hum then return nil end
+    if not S.humLocked or not S.humCache or S.humCache.Character ~= char then
+        S.humCache = { Character = char }
+        for _, prop in ipairs(HUM_PROPS) do
+            pcall(function() S.humCache[prop] = hum[prop] end)
+        end
+        S.realWalk = S.humCache.WalkSpeed or hum.WalkSpeed
     end
+    local clone
+    local ok = pcall(function()
+        hum.Archivable = true
+        clone = hum:Clone()
+        clone.BreakJointsOnDeath = false
+        hum:Destroy()
+        clone.Parent = char
+        clone.WalkSpeed = 0
+        if not clone:FindFirstChildOfClass("Animator") then
+            Instance.new("Animator").Parent = clone
+        end
+        clone:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+        clone:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+    end)
+    if not ok or not clone or not clone.Parent then
+        verbose("humSwap failed - staying on plain walk")
+        S.humLocked = false
+        releaseControls()
+        return nil
+    end
+    hrp.AssemblyLinearVelocity, hrp.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+    S.humLocked = true
+    return clone
 end
-applyMovement(Config.WalkSpeed)
 
--- Anti AFK ----------------------------------------------------------------------
-track(UserInputService.Idled:Connect(function()
-    if Config.AntiAFK then
-        safeCall(function()
-            VirtualUser:CaptureController()
-            VirtualUser:Set2DInput(true)
+local function humRestore()
+    if S.humTween then
+        pcall(function() S.humTween:Cancel() end)
+        S.humTween = nil
+    end
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        -- only restore WalkSpeed if WE pushed it to 0 (never fight the game)
+        local cached = (S.humCache and S.humCache.Character == char) and S.humCache or nil
+        if hum.WalkSpeed == 0 then
+            local want = (cached and cached.WalkSpeed) or S.realWalk
+            if want and want > 0 then pcall(function() hum.WalkSpeed = want end) end
+        end
+        if cached then
+            for _, prop in ipairs(HUM_PROPS) do
+                if prop ~= "WalkSpeed" and cached[prop] ~= nil then
+                    pcall(function() hum[prop] = cached[prop] end)
+                end
+            end
+        end
+    end
+    if hrp then
+        hrp.AssemblyLinearVelocity, hrp.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+    end
+    S.humLocked = false
+end
+
+local function unlockCharacter()
+    local _, hrp = charParts()
+    if hrp and hrp.Anchored then
+        pcall(function()
+            hrp.Anchored = false
+            hrp.AssemblyLinearVelocity = Vector3.zero
         end)
     end
-end))
+    if S.humLocked then humRestore() end
+end
 
--- Infinite jump ------------------------------------------------------------------
-track(UserInputService.JumpRequest:Connect(function()
-    if not Config.InfJump then return end
-    local hum = findHumanoid()
-    if hum then
-        safeCall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+local function humSpeed()
+    return math.max(8, realWalkSpeed() * 2) -- 2x = the measured safe ceiling
+end
+
+local function humLeg(targetCF, speed)
+    local _, hrp = charParts()
+    if not hrp then return false end
+    pcall(function()
+        hrp.AssemblyLinearVelocity, hrp.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+    end)
+    local dist = (targetCF.Position - hrp.Position).Magnitude
+    local dur = math.max(0.03, dist / math.max(1, speed))
+    local tw = TweenService:Create(hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = targetCF })
+    S.humTween = tw
+    local done, state = false, nil
+    tw.Completed:Once(function(st) done, state = true, st end)
+    tw:Play()
+    local deadline = os.clock() + dur + 0.4
+    while not done and os.clock() < deadline and not SESSION.dead do task.wait() end
+    if S.humTween == tw then S.humTween = nil end
+    if not done then pcall(function() tw:Cancel() end) end
+    if state == Enum.PlaybackState.Completed and hrp.Parent then
+        pcall(function() hrp.CFrame = targetCF end)
     end
-end))
+    pcall(function()
+        hrp.AssemblyLinearVelocity, hrp.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+    end)
+    return done
+end
 
--- NoClip ---------------------------------------------------------------------
-track(RunService.Stepped:Connect(function()
-    if not Config.Noclip then return end
-    local char = findChar()
-    if char then
-        for _, part in ipairs(char:GetChildren()) do
-            if part:IsA("BasePart") and part.CanCollide then
-                part.CanCollide = false
+local function humTweenTo(target, tol, timeout)
+    tol = tol or 5
+    grabControls()
+    local deadline = os.clock() + (timeout or 60)
+    local rollbacks = 0
+
+    if not humSwap() then
+        humRestore()
+        releaseControls()
+        return walkTo(target, tol, timeout)
+    end
+
+    local survived = false
+    while os.clock() < deadline do
+        if SESSION.dead then break end
+        local _, hrp, hum = charParts()
+        if not hrp or not hum then break end
+
+        local delta = target - hrp.Position
+        local flat = Vector3.new(delta.X, 0, delta.Z)
+        if flat.Magnitude <= tol then survived = true break end
+
+        -- game swapped our humanoid again (e.g. respawn) -> re-swap
+        if hum.WalkSpeed > 0 and S.humLocked then
+            if not humSwap() then break end
+        end
+
+        local step = math.min(18, flat.Magnitude)
+        local dir = flat.Magnitude > 0.05 and flat.Unit or hrp.CFrame.LookVector
+        local nextPos = hrp.Position + dir * step
+        local gy = groundY(nextPos)
+        if gy then
+            gy = gy - 3.2 + 3.2
+            local dy = math.clamp(gy - hrp.Position.Y, -8, 8)
+            nextPos = Vector3.new(nextPos.X, hrp.Position.Y + dy, nextPos.Z)
+        end
+
+        local from = hrp.Position
+        humLeg(CFrame.new(nextPos, nextPos + dir), humSpeed())
+
+        local moved = ((hrp.Parent and hrp.Position or from) - from).Magnitude
+        if moved < step * 0.4 then
+            rollbacks = rollbacks + 1
+            if rollbacks >= 3 then
+                verbose("fast mode pushed back - falling back to walking")
+                break
+            end
+        else
+            rollbacks = 0
+        end
+        task.wait()
+    end
+    humRestore()
+    releaseControls()
+    if survived then return true end
+    return walkTo(target, tol, math.max(15, (timeout or 60) - 20))
+end
+
+local function goTo(target, tol, timeout)
+    if Config.FastMode then
+        return humTweenTo(target, tol, timeout)
+    end
+    return walkTo(target, tol, timeout)
+end
+
+local function goHome()
+    local ok = goTo(homePoint(), 6, 60)
+    task.wait(0.35)
+    return ok
+end
+
+local function stopNavigation()
+    unlockCharacter()
+    releaseControls()
+end
+
+--------------------------------------------------------------------------------
+-- FEATURE: STEAL  (walk to egg -> carry -> walk into your PetArea)
+--------------------------------------------------------------------------------
+local function stealEgg(cand)
+    local rec = cand.rec
+    local eggPos = rec.BottomCFrame and rec.BottomCFrame.Position
+    if not eggPos then return false end
+
+    S.status = "steal " .. tostring(rec.AssetCategory) .. " @ " .. tostring(rec.AreaId)
+    if not goTo(eggPos + Vector3.new(0, 3, 0), 4, 90) then
+        S.failed = S.failed + 1
+        return false
+    end
+    task.wait(0.35)
+
+    for attempt = 1, 2 do
+        if SESSION.dead then return false end
+        -- Primary: the same request the in-game button sends
+        local carried = false
+        local ok, res, why = invoke("Eggs: RequestAreaEggCarry", 6, { Uid = rec.Uid })
+        carried = ok and res and true or false
+        if ok and not res and attempt == 1 then
+            verbose("carry refused:", tostring(why))
+        end
+        -- Fallback: fire the physical prompt (skips the 1.2s hold)
+        if not carried then
+            promptCache.at = 0
+            local best, bd
+            for _, e in ipairs(refreshPrompts()) do
+                if e.prompt.Parent and eggPos then
+                    local d = (e.part.Position - eggPos).Magnitude
+                    if not bd or d < bd then best, bd = e.prompt, d end
+                end
+            end
+            if best and not carried and bd <= 16 and typeof(fireproximityprompt) == "function" then
+                pcall(function() fireproximityprompt(best, 1) end)
+                carried = true
+            end
+        end
+
+        -- Confirm the grab before walking home.
+        -- The carry-state event (when present) is the most reliable signal;
+        -- otherwise trust the remote's own answer.
+        if carried then
+            S.stolen = S.stolen + 1
+            S.carryMul = (S.carrying and S.carrying.SpeedMultiplier) or cand.carryMul or 1
+            return true
+        end
+        local t0 = os.clock()
+        while os.clock() - t0 < (tonumber(Config.GrabTimeout) or 6) do
+            if SESSION.dead then return false end
+            if S.carrying then
+                S.stolen = S.stolen + 1
+                S.carryMul = S.carrying.SpeedMultiplier or cand.carryMul or 1
+                return true
+            end
+            task.wait(0.1)
+        end
+        -- still nothing: creep closer and try again
+        goTo(eggPos + Vector3.new(0, 2, 0), 2, 25)
+        task.wait(0.3)
+    end
+    S.failed = S.failed + 1
+    return false
+end
+
+-- Walking into your own PetArea is how the server converts a carried egg
+-- into YOUR record. If a carry-state event is wired, we wait for it to clear.
+local function carryHome()
+    S.status = "carry home"
+    goTo(homePoint(), 6, 70)
+    if S.carrying == nil then return true end
+    local t0 = os.clock()
+    while os.clock() - t0 < (tonumber(Config.ClaimTimeout) or 14) do
+        if SESSION.dead then return false end
+        if S.carrying == nil then return true end
+        task.wait(0.2)
+        if os.clock() - t0 > 2 then
+            -- nudge around the pen in case the trigger zone needs a re-entry
+            goTo(homePoint() + Vector3.new(math.random(-6, 6), 0, math.random(-6, 6)), 4, 12)
+        end
+    end
+    verbose("claim timed out")
+    S.failed = S.failed + 1
+    return false
+end
+
+--------------------------------------------------------------------------------
+-- FEATURE: BASE WORK  (place / hatch / equip / sell)
+--------------------------------------------------------------------------------
+local function freeSpot(taken)
+    if not S.pen or not S.origin then return nil end
+    local size = S.pen.Size
+    local mx = math.max(4, size.X / 2 - 5)
+    local mz = math.max(4, size.Z / 2 - 5)
+    for _ = 1, 60 do
+        local world = S.pen.CFrame * CFrame.new(
+            math.random(-math.floor(mx), math.floor(mx)),
+            size.Y / 2 + 1,
+            math.random(-math.floor(mz), math.floor(mz)))
+        local clear = true
+        for _, p in ipairs(taken) do
+            if (p - world.Position).Magnitude < 6 then clear = false break end
+        end
+        if clear then return world end
+    end
+    return S.pen.CFrame * CFrame.new(math.random(-10, 10), size.Y / 2 + 1, math.random(-10, 10))
+end
+
+local function placeEggs()
+    if not Config.AutoPlace then return end
+    if not S.pen or not S.origin then return end
+    local pending, taken = {}, {}
+    for uid, rec in pairs(myEggRecords()) do
+        if type(rec) == "table" then
+            if rec.Placement and rec.Placement.LocalCFrame then
+                taken[#taken + 1] = (S.origin.CFrame * rec.Placement.LocalCFrame).Position
+            elseif not rec.Placement then
+                pending[#pending + 1] = { uid = uid, rec = rec }
             end
         end
     end
-end))
-
---------------------------------------------------------------------------------
--- FEATURE: Auto Steal
---------------------------------------------------------------------------------
-local lastAttempt = {}
-local stealThread = nil
-
-local function passesFilters(record, uid)
-    local pos = eggPositionOf(record)
-    if not pos then return false end
-    local area = record.AreaId or record.Area
-    if next(Config.StealAreas) and area and not Config.StealAreas[area] then
-        return false
+    for _, item in ipairs(pending) do
+        if SESSION.dead then return end
+        local world = freeSpot(taken)
+        if world then
+            local localCF = S.origin.CFrame:ToObjectSpace(world)
+            -- EXACT signature the game's own UI sends:
+            --   RF/EggWorld/AskPlaceEgg  { Uid, LocalCFrame }
+            local ok, res, reason = invoke("Eggs: RequestPlaceEgg", 8, { Uid = item.uid, LocalCFrame = localCF })
+            if ok and res then
+                S.placed = S.placed + 1
+                taken[#taken + 1] = world.Position
+                verbose("placed", tostring(item.rec.AssetCategory))
+            else
+                verbose("place failed", tostring(reason))
+            end
+            task.wait(0.15)
+        end
     end
-    local _, rank = eggRarityOf(record)
-    if rank > 0 and rank < (Config.StealMinRarity or 1) then
-        return false
-    end
-    if hasEggInInventory(uid) then return false end
-    local cooldown = lastAttempt[uid]
-    if cooldown and os.clock() < cooldown then return false end
-    return true
 end
 
-local function pickTarget()
-    local records = fieldEggs()
-    if not records then return nil end
-    local root = findRoot()
-    local rootPos = root and root.Position
-    local best, bestScore = nil, nil
-    for uid, record in pairs(records) do
-        if type(record) == "table" then
-            if passesFilters(record, uid) then
-                local pos = eggPositionOf(record)
-                local _, rank = eggRarityOf(record)
-                local income = eggIncomeOf(record)
-                local dist = rootPos and pos and (rootPos - pos).Magnitude or math.huge
-                local score
-                if Config.StealPriority == "Nearest" then
-                    score = -dist
-                elseif Config.StealPriority == "Richest" then
-                    score = income * 1000 - dist * 0.01
-                else
-                    score = (rank > 0 and rank or 1) * 100000 - dist
+local function eggReadyToHatch(uid, rec, placedAt)
+    local fn = G.EggState and (G.EggState.IsReadyToHatch or G.EggState.IsLocalEggReady)
+    if fn then
+        local ok, r = pcall(fn, uid)
+        if ok then return r == true end
+    end
+    local now = Workspace:GetServerTimeNow()
+    local need = growthTime(rec.AssetCategory) / math.max(0.01, rec.GrowthSpeedMultiplier or 1)
+    return (now - (placedAt or now)) >= need
+end
+
+local function hatchReady()
+    if not Config.AutoHatch then return end
+    for uid, rec in pairs(myEggRecords()) do
+        if SESSION.dead then return end
+        if type(rec) == "table" and rec.Placement then
+            local placedAt = rec.Placement.PlacedAt
+            if eggReadyToHatch(uid, rec, placedAt) then
+                -- TWO steps: AskHatch starts it, wait, then AskFinishHatch ends it
+                local ok, res = invoke("Eggs: RequestHatchEgg", 8, uid)
+                if ok and res then
+                    task.wait(0.9)
+                    local ok2, res2, _, petUid = invoke("Eggs: RequestCompleteHatchEgg", 8, uid)
+                    if ok2 and res2 then
+                        S.hatched = S.hatched + 1
+                        verbose("hatched", tostring(rec.AssetCategory))
+                    end
                 end
-                if bestScore == nil or score > bestScore then
-                    best = record
-                    bestScore = score
-                    best.Uid = best.Uid or uid
+                task.wait(0.2)
+            end
+        end
+    end
+end
+
+local function equipAndSell()
+    local bag = bagTools()
+    if #bag == 0 and not Config.AutoSell then return end
+    local pets, count = myPets()
+    local limit = equipLimit()
+
+    table.sort(bag, function(a, b) return bagPetValue(a) > bagPetValue(b) end)
+    for _, tool in ipairs(bag) do
+        if SESSION.dead then return end
+        local uid = tool:GetAttribute("UID")
+        if uid then
+            local val = bagPetValue(tool)
+            if count < limit then
+                if Config.AutoEquip then
+                    local ok, res = invoke("ActiveAssets: RequestEquip", 8, uid)
+                    if ok and res then
+                        count = count + 1
+                        verbose("equipped", short(val) .. "/s")
+                    end
+                    task.wait(0.12)
+                end
+            elseif Config.AutoSell then
+                local worst = pets[#pets]
+                if worst and val > worst.mps then
+                    -- pen is full: replace the worst pet with this better one
+                    local ok, res = invoke("ActiveAssets: RequestSell", 8, worst.uid)
+                    if ok and res then
+                        S.sold = S.sold + 1
+                        table.remove(pets, #pets)
+                        count = count - 1
+                        verbose("sold worst", short(worst.mps), "<-", short(val))
+                        task.wait(0.12)
+                        local ok2, res2 = invoke("ActiveAssets: RequestEquip", 8, uid)
+                        if ok2 and res2 then
+                            count = count + 1
+                        end
+                    end
+                elseif Config.SellBackpack and worst and val <= worst.mps then
+                    local ok, res = invoke("ActiveAssets: RequestSell", 8, uid)
+                    if ok and res then
+                        S.sold = S.sold + 1
+                        verbose("sold bag pet", short(val))
+                        task.wait(0.12)
+                    end
                 end
             end
         end
     end
-    return best
 end
 
-local function returnHome()
-    local pos = plotCenter()
-    if not pos then return false end
-    if Config.StealTeleport then
-        teleportTo(pos)
-        task.wait(0.4)
-        return true
+local function claimOffline()
+    if not Config.AutoClaimOffline then return end
+    local ok, sum = invoke("OfflineAssets: GetSummary", 6)
+    if ok and type(sum) == "table" and (sum.ClaimableAmount or 0) > 0 then
+        invoke("OfflineAssets: Redeem", 8)
+        verbose("claimed offline", short(sum.ClaimableAmount))
     end
-    return walkTo(pos, Config.StealSpeed, 15)
 end
 
-local function tryPickup(uid)
-    callRemote("RF/EggWorld/AskFieldEggCarry", false, { Uid = uid })
-    task.wait(0.1)
-    local root = findRoot()
-    if root then
-        local prompt = findPromptNearEgg(root.Position, 22)
-        if prompt and fireproximityprompt then
-            safeCall(function()
-                prompt.HoldDuration = 0
-                fireproximityprompt(prompt)
-            end)
+--------------------------------------------------------------------------------
+-- FEATURE: UPGRADES (treadmill = the legit way to run faster)
+--------------------------------------------------------------------------------
+local function treadmillTiers()
+    if not G.Tread then return {} end
+    local TD = G.Tread.Directory or G.Tread
+    local list = {}
+    for id, cfg in pairs(TD) do
+        if type(cfg) == "table" then
+            list[#list + 1] = {
+                id    = cfg._id or id,       -- AskTierRaise eats the _id (e.g. "DemonicTreadmill")
+                price = cfg.Price or 0,
+                mult  = cfg.SpeedMultiplier or 0,
+                level = cfg.UpgradeLevel,
+            }
         end
     end
-    task.wait(0.3)
-    return hasEggInInventory(uid)
+    table.sort(list, function(a, b) return a.price < b.price end)
+    return list
 end
 
-local function firstUnplacedEgg()
-    local inv = getEggInventory()
-    if not inv then return nil end
-    for uid, data in pairs(inv) do
-        if type(data) == "table" and not data.Placement and not data.Locked then
-            return uid
+local function padLevelText(model)
+    if not model then return nil end
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("TextLabel") then
+            local cur, nxt = tostring(d.Text):match("Level%s+(%d+)%s*>%s*Level%s+(%d+)")
+            if cur then return tonumber(cur), tonumber(nxt) end
         end
     end
     return nil
 end
 
-local function stealLoop()
-    while not SESSION.dead and Config.AutoSteal do
-        local target = pickTarget()
-        local carrying = firstUnplacedEgg()
-
-        if not carrying and not target then
-            task.wait(1.2)
-            continue
+local function treadLevel()
+    if G.Save and G.Save.Get then
+        local ok, save = pcall(G.Save.Get)
+        if ok and type(save) == "table" and tonumber(save.TreadmillUpgradeLevel) then
+            return tonumber(save.TreadmillUpgradeLevel)
         end
+    end
+    return padLevelText(S.plot and S.plot:FindFirstChild("TreadmillUpgrade"))
+end
 
-        if carrying then
-            -- Always deliver what we hold first
-            returnHome()
-            task.wait(0.5)
-            if Config.AutoPlace then
-                safeCall(function()
-                    callRemote("RF/EggWorld/AskPlaceEgg", false, { Uid = carrying })
-                end)
-            end
-        else
-            local uid = target.Uid or target.UID
-            local pos = eggPositionOf(target)
-            if pos then
-                if Config.StealTeleport then
-                    teleportTo(pos + Vector3.new(0, 2, 0))
-                else
-                    walkTo(pos, Config.StealSpeed, 30)
-                end
-                task.wait(0.2)
-                if not hasEggInInventory(uid) then
-                    if not tryPickup(uid) then
-                        lastAttempt[uid] = os.clock() + (Config.CooldownFailed or 1.5)
-                    else
-                        Notify("Steal", "Egg secured — heading home.", "success")
-                    end
-                end
-            else
-                lastAttempt[uid] = os.clock() + 2
-            end
+local function upgradeTreadmill()
+    if not Config.AutoUpTreadmill then return end
+    local cur = treadLevel()
+    local tiers = treadmillTiers()
+    if #tiers == 0 then return end
+
+    local target
+    if cur and G.Tread and G.Tread.GetByUpgradeLevel then
+        local ok, cfg = pcall(G.Tread.GetByUpgradeLevel, cur + 1)
+        if ok and type(cfg) == "table" and cfg._id then
+            target = { id = cfg._id, price = cfg.Price or 0, mult = cfg.SpeedMultiplier or 0 }
         end
-        task.wait(0.25)
+    end
+    if not target then target = tiers[(cur and (cur + 1)) or 2] end
+    if not target then return end
+
+    -- price cap: Config.MaxTreadmillPrice is an exponent (6 => ~$1M, 9 => ~$1B)
+    local capExp = tonumber(Config.MaxTreadmillPrice) or 0
+    if capExp > 0 then
+        local cap = 10 ^ capExp
+        if target.price > cap then return end
+    end
+    local cash = cashAmount()
+    if cash > 0 and target.price > cash then return end
+
+    local ok, res, reason = invoke("Treadmills: RequestUpgrade", 8, target.id)
+    if ok and res then
+        verbose("treadmill upgraded ->", target.id)
+    else
+        verbose("treadmill upgrade refused:", tostring(reason))
     end
 end
 
-local function ensureStealThread()
-    if not Config.AutoSteal then
-        if navigating then stopNavigation() end
+--------------------------------------------------------------------------------
+-- FEATURE: TRAIN SPEED  (stand on your treadmill; the game raises Speed)
+--------------------------------------------------------------------------------
+local function tooSlowToSteal()
+    return realWalkSpeed() < easiestGuard() * 1.15
+end
+
+local function rideTreadmill(seconds)
+    if not S.tread then return end
+    S.status = "treadmill training"
+    local pos = S.tread.Position + Vector3.new(0, 4, 0)
+    goTo(pos, 5, 60)
+    local t0 = os.clock()
+    while not SESSION.dead and os.clock() - t0 < (seconds or 20) do
+        local _, hrp = charParts()
+        if hrp and (hrp.Position - pos).Magnitude > 8 then
+            goTo(pos, 4, 20)
+        end
+        task.wait(0.5)
+    end
+end
+
+--------------------------------------------------------------------------------
+-- SAFETY
+--------------------------------------------------------------------------------
+local function guardCharacter(char)
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    pcall(function()
+        hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+        hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+    end)
+end
+local function isDead()
+    local h = humanoidAlive()
+    return h == nil and (LocalPlayer.Character ~= nil)
+end
+
+-- Client-side :Kick blocker. NOTE: this CANNOT block server BAC kicks —
+-- staying under the server's radar is what keeps you in the game.
+local function installAntiKick()
+    local genv = getgenv()
+    if genv.__GabHubSAE_AntiKick then return end
+    local ok = pcall(function()
+        local mt = getrawmetatable(game)
+        local old = mt.__namecall
+        setreadonly(mt, false)
+        mt.__namecall = newcclosure(function(self, ...)
+            local m = getnamecallmethod()
+            if m == "Kick" and typeof(self) == "Instance" and self:IsA("Player") then
+                verbose("blocked client-side Kick")
+                return nil
+            end
+            return old(self, ...)
+        end)
+        setreadonly(mt, true)
+    end)
+    genv.__GabHubSAE_AntiKick = ok and true or nil
+    verbose("anti-kick hook:", ok and "installed (client-side only)" or "failed")
+end
+
+track(LocalPlayer.CharacterAdded:Connect(function(char)
+    S.carrying = nil
+    S.carryMul = 1
+    task.wait(0.5)
+    guardCharacter(char)
+    resolvePlot()
+    S.notifiedDeath = false
+end))
+if LocalPlayer.Character then guardCharacter(LocalPlayer.Character) end
+
+track(UserInputService.Idled:Connect(function()
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new(0, 0))
+    end)
+end))
+
+--------------------------------------------------------------------------------
+-- MAIN CYCLE  (steal -> claim -> place -> hatch -> equip/sell -> train)
+--------------------------------------------------------------------------------
+local function handleAreaReset()
+    if not S.resetting then return false end
+    S.status = "zone reset — holding at base"
+    goHome()
+    while not SESSION.dead and os.clock() < S.resetUntil do task.wait(0.5) end
+    S.status = "waiting for eggs to respawn"
+    local t0 = os.clock()
+    while not SESSION.dead and os.clock() - t0 < 60 do
+        local n = 0
+        for _, rec in pairs(fieldSnapshotRecords()) do
+            if type(rec) == "table" and rec.State == "Slot" then n = n + 1 end
+        end
+        if n >= 5 then break end
+        task.wait(2)
+    end
+    S.resetting = false
+    promptCache.at = 0
+    return true
+end
+
+local function tendBase()
+    S.status = "base work"
+    -- If stealing is on we may be out in a guard zone; base chores are safer home.
+    if S.plot and Config.AutoSteal then goHome() end
+    placeEggs()
+    hatchReady()
+    equipAndSell()
+    upgradeTreadmill()
+end
+
+--------------------------------------------------------------------------------
+-- MAIN LOOP BODY
+--------------------------------------------------------------------------------
+
+local function anyFeatureOn()
+    return Config.AutoSteal or Config.AutoPlace or Config.AutoHatch
+        or Config.AutoEquip or Config.AutoSell or Config.AutoClaimOffline
+        or Config.AutoTrain or Config.AutoUpTreadmill
+end
+
+local function mainCycle()
+    S.loops = S.loops + 1
+
+    if handleAreaReset() then return end
+
+    -- dying in this game means you must rejoin — stop everything politely
+    local humNow = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if humNow and humNow.Health <= 0 then
+        if not S.notifiedDeath then
+            S.notifiedDeath = true
+            Notify("Gab Hub", "Character died. In this game you must rejoin — automation paused.", "error")
+        end
+        S.status = "dead — rejoin to continue"
+        task.wait(5)
         return
     end
-    local alive = stealThread
-        and coroutine.status(stealThread) ~= "dead"
-    if not alive then
-        stealThread = task.spawn(function()
-            local ok, err = pcall(stealLoop)
-            if not ok then
-                warn("[GabHub] steal loop:", tostring(err))
-            end
-        end)
-    end
-end
-track(RunService.Heartbeat:Connect(ensureStealThread))
+    S.notifiedDeath = false
 
---------------------------------------------------------------------------------
--- FEATURE: Auto Place / Auto Hatch  (~ every 2s)
---------------------------------------------------------------------------------
-track(RunService.Heartbeat:Connect(function()
-    if SESSION.dead or os.clock() % 2 > 0.2 then return end
-    local inv = getEggInventory()
-    if not inv then return end
-    -- Process at most ONE egg per cycle (round-robin over time) so we never
-    -- burst remote calls -> the fastest legit-looking pace.
-    for uid, data in pairs(inv) do
-        if type(data) == "table" then
-            local _, rank = eggRarityOf(data)
-            if Config.AutoPlace and not data.Placement and not data.Locked
-            and rank >= (Config.PlaceMinRarity or 1) then
-                safeCall(function()
-                    callRemote("RF/EggWorld/AskPlaceEgg", false, { Uid = uid })
-                end)
-                break
+    if Config.AutoSteal and S.plot then
+        local pets = myPets()
+        local ownedBest = pets[1] and pets[1].mps or 0
+        S.ownedBest = ownedBest
+        local list = candidates(ownedBest)
+
+        if #list == 0 then
+            S.status = string.format("no eggs to take (walk %.0f)", realWalkSpeed())
+            if tooSlowToSteal() and Config.AutoTrainWhenSlow and Config.AutoTrain then
+                rideTreadmill(tonumber(Config.TreadmillSeconds) or 20)
+            else
+                tendBase()
+                task.wait(Config.AutoSteal and 3 or 1)
             end
-            if Config.AutoHatch and data.Placement then
-                safeCall(function()
-                    callRemote("RF/EggWorld/AskFinishHatch", false, { Uid = uid })
-                end)
-                break
-            end
+            return
         end
-    end
-end))
 
---------------------------------------------------------------------------------
--- FEATURE: Auto Sell eggs & pets  (~ every 2.5s)
---------------------------------------------------------------------------------
-local function sellPass()
-    local inv = getEggInventory()
-    if not inv then return 0 end
-    local wear = getRemote("RF/EggWorld/AskWearTool")
-    local sell = getRemote("RE/PetSatchel/SellPet")
-    if not wear or not sell then return 0 end
-    local sold = 0
-    for uid, data in pairs(inv) do
-        if type(data) == "table" and not data.Placement and not data.Locked then
-            local _, rank = eggRarityOf(data)
-            if rank > 0 and rank <= (Config.SellMaxRarity or 4) then
-                local ok = pcall(function()
-                    wear:InvokeServer(uid)
-                    sell:FireServer({ uid })
-                end)
-                if ok then
-                    sold += 1
-                    task.wait(0.12)
-                end
+        local grabbed, tried = 0, {}
+        local chain = math.max(1, math.min(tonumber(Config.ChainGrab) or 5, 8))
+        while grabbed < chain do
+            if SESSION.dead or Config.AutoSteal == false then break end
+            local cand
+            for _, c in ipairs(list) do
+                if not tried[c.rec.Uid] then cand = c break end
             end
-        end
-    end
-    return sold
-end
+            if not cand then break end
+            tried[cand.rec.Uid] = true
 
-local function sellPetsPass()
-    local data = getSave()
-    local pets = data and (data.PetInventory or data.Pets)
-    if type(pets) ~= "table" then return 0 end
-    local sell = getRemote("RE/PetSatchel/SellPet")
-    if not sell then return 0 end
-    local count = 0
-    for uid, pet in pairs(pets) do
-        if type(pet) == "table" then
-            if pet.Placement or pet.Equipped or pet.Locked then continue end
-            local _, rank = eggRarityOf(pet)
-            if rank > 0 and rank <= (Config.SellMaxRarity or 4) then
-                local ok = pcall(function() sell:FireServer({ uid }) end)
-                if ok then
-                    count += 1
-                    task.wait(0.12)
-                end
-            end
-        end
-    end
-    return count
-end
-
-track(RunService.Heartbeat:Connect(function()
-    if SESSION.dead or os.clock() % 2.5 > 0.2 then return end
-    if Config.AutoSellEggs then
-        sellPass()
-    end
-    if Config.AutoSellPets then
-        sellPetsPass()
-    end
-end))
-
---------------------------------------------------------------------------------
--- FEATURE: Claim / upgrades / treadmill / trail (~ every 6s)
---------------------------------------------------------------------------------
-local function upgradeBase()
-    safeCall(function()
-        local re = getRemote("RE/Homestead/AskNearbyPurchase")
-        if re then re:FireServer() end
-    end)
-    safeCall(function()
-        local re = getRemote("RE/Homestead/AskBaseTierRaise")
-        if re then re:FireServer() end
-    end)
-end
-
-track(RunService.Heartbeat:Connect(function()
-    if SESSION.dead or os.clock() % 6 > 0.25 then return end
-    if Config.AutoClaim then
-        safeCall(function() callRemote("RF/AwayEarnings/AskCollect", false) end)
-        safeCall(function() callRemote("RF/Codex/AskRedeemAll", false) end)
-        safeCall(function() callRemote("RF/GroupPerk/RedeemPerk", false) end)
-    end
-    if Config.AutoBaseUp then
-        upgradeBase()
-    end
-    if Config.AutoEquipBest then
-        safeCall(function()
-            local rf = getRemote("RF/Haul/WearBest") or getRemote("RF/PenRoster/ConfirmEquipBestBadge")
-            if rf then rf:InvokeServer() end
-        end)
-    end
-    if Config.AutoBuyTrail then
-        safeCall(function()
-            local rf = getRemote("RF/Trailwear/AskPurchase")
-            if rf then rf:InvokeServer() end
-        end)
-    end
-    if Config.AutoTreadmill then
-        local plot = myPlot()
-        if plot then
-            local seat = nil
-            for _, obj in ipairs(plot:GetDescendants()) do
-                local n = tostring(obj.Name):lower()
-                if n:find("treadmill", 1, true) then
-                    if obj:IsA("Seat") then
-                        seat = obj
-                        break
-                    else
-                        local inner = obj:FindFirstChildWhichIsA("Seat", true)
-                        if inner then
-                            seat = inner
-                            break
-                        end
-                    end
-                end
-            end
-            local hum = findHumanoid()
-            local root = findRoot()
-            if seat and hum and root then
-                local pos = seat:IsA("BasePart") and seat.Position or nil
-                if pos and (root.Position - pos).Magnitude > 6 then
-                    walkTo(pos, Config.StealSpeed, 10)
-                end
-                if not seat.Occupant then
-                    safeCall(function() seat:Sit(hum) end)
-                end
-                safeCall(function()
-                    local rf = getRemote("RF/Treadmill/AskTierRaise")
-                    if rf then rf:InvokeServer() end
-                end)
-            end
-        end
-    end
-end))
-
---------------------------------------------------------------------------------
--- FEATURE: Combat (bat + guards)
---------------------------------------------------------------------------------
-local function swingBat()
-    safeCall(function()
-        local re = getRemote("RE/BatSwing/Trigger")
-        if re then re:FireServer() end
-    end)
-end
-local function strikeNearby()
-    safeCall(function()
-        local re = getRemote("RE/GuardPatrol/ForestStrike")
-        if re then re:FireServer() end
-    end)
-end
-
-track(RunService.Heartbeat:Connect(function()
-    if SESSION.dead or os.clock() % (Config.BatDelay or 0.25) > 0.06 then return end
-    local root = findRoot()
-    if not root then return end
-    if Config.BatAura then
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer then
-                local r = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
-                if r and (r.Position - root.Position).Magnitude <= (Config.BatRadius or 14) then
-                    swingBat()
+            -- re-fetch every grab: someone may have taken the egg in the meantime
+            if stealEgg(cand) then
+                if carryHome() then
+                    grabbed = grabbed + 1
+                else
+                    verbose("claim timed out - back to base")
+                    tendBase()
                     break
                 end
             end
+            if grabbed < chain then
+                list = candidates(ownedBest)
+                if #list == 0 then break end
+            end
+            task.wait(0.4)
+        end
+
+        if grabbed > 0 then tendBase() end
+        task.wait(0.5)
+    else
+        -- steal off: only light base chores when they are individually enabled
+        if Config.AutoPlace or Config.AutoHatch or Config.AutoEquip or Config.AutoSell then
+            tendBase()
+            task.wait(2)
+        elseif Config.AutoTrain and S.tread and tooSlowToSteal() then
+            rideTreadmill(tonumber(Config.TreadmillSeconds) or 20)
+            task.wait(1)
+        else
+            S.status = "idle — enable a feature"
+            task.wait(1)
         end
     end
-    if Config.GuardAura then
-        strikeNearby()
-    end
-end))
+end
 
-track(RunService.Heartbeat:Connect(function()
-    if SESSION.dead or not Config.DefendEgg or os.clock() % 0.4 > 0.08 then return end
-    local root = findRoot()
-    if not root then return end
-    local home = plotCenter()
-    if not home or (root.Position - home).Magnitude > 55 then return end
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer then
-            local r = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
-            local h = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
-            if r and h and h.Health > 0 and (r.Position - home).Magnitude < 26 then
-                swingBat()
-                break
+local function spawnLoop(fn)
+    local t = task.spawn(function()
+        while not SESSION.dead do
+            local ok, err = pcall(fn)
+            if not ok then
+                verbose("loop error:", tostring(err))
+                task.wait(0.2)
             end
         end
-    end
-end))
+    end)
+    table.insert(S.threads, t)
+    return t
+end
 
 --------------------------------------------------------------------------------
--- FEATURE: Egg ESP
+-- FEATURE: Egg ESP (client-only rendering; safe)
 --------------------------------------------------------------------------------
 local espGui = nil
 local function ensureEspGui()
@@ -1037,50 +1583,44 @@ local function ensureEspGui()
         local ok = pcall(function()
             espGui.Parent = (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui")
         end)
-        if (not ok or not espGui.Parent) and LocalPlayer:FindFirstChild("PlayerGui") then
-            espGui.Parent = LocalPlayer.PlayerGui
+        if (not ok or not espGui.Parent) then
+            espGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
         end
     end
     return espGui
 end
 
+local lastEsp = 0
 track(RunService.Heartbeat:Connect(function()
-    if not Config.EggESP then
-        if espGui then espGui:ClearAllChildren() end
-        return
-    end
-    if SESSION.dead or os.clock() % 1 > 0.25 then return end
+    if SESSION.dead or not Config.EggESP then return end
+    if os.clock() - lastEsp < 1 then return end
+    lastEsp = os.clock()
     local camera = Workspace.CurrentCamera
-    local root = findRoot()
+    local _, root = charParts()
     if not camera or not root then return end
     local gui = ensureEspGui()
     gui:ClearAllChildren()
-    local records = fieldEggs()
-    if not records then return end
-    for uid, record in pairs(records) do
-        if type(record) == "table" then
-            local pos = eggPositionOf(record)
-            if pos and (pos - root.Position).Magnitude <= (Config.ESPDistance or 250) then
+    for _, rec in pairs(fieldSnapshotRecords()) do
+        if type(rec) == "table" and rec.BottomCFrame then
+            local pos = rec.BottomCFrame.Position
+            if (pos - root.Position).Magnitude <= (tonumber(Config.ESPDistance) or 250) then
                 local screen, onScreen = camera:WorldToViewportPoint(pos)
                 if onScreen then
-                    local rarity, rank = eggRarityOf(record)
+                    local val = eggValue(rec)
                     local label = Instance.new("TextLabel")
-                    label.Name = "GabESP_" .. tostring(uid)
-                    label.Text = ("%s\n[%s]"):format(
-                        tostring(record.Name or record.EggName or "Egg"),
-                        tostring(rarity))
+                    label.Name = "GabESP"
+                    label.Text = ("%s\n%s/s"):format(
+                        tostring(rec.AssetCategory or "Egg"), short(val))
                     label.Font = Enum.Font.GothamBold
                     label.TextSize = 13
-                    label.TextColor3 = rank >= 8 and Color3.fromRGB(255, 70, 160)
-                        or rank >= 6 and Color3.fromRGB(255, 90, 60)
-                        or Color3.fromRGB(255, 200, 120)
-                    label.TextStrokeTransparency = 0.25
+                    label.TextColor3 = val > (S.ownedBest or 0) * 0.5
+                        and Color3.fromRGB(255, 90, 60) or Color3.fromRGB(255, 200, 120)
+                    label.TextStrokeTransparency = 0.3
                     label.BackgroundTransparency = 0.4
                     label.BackgroundColor3 = Color3.new(0, 0, 0)
                     label.BorderSizePixel = 0
-                    label.Size = UDim2.fromOffset(96, 34)
-                    label.Position = UDim2.new(0, screen.X - 48, 0, screen.Y - 17)
-                    label.AutomaticSize = Enum.AutomaticSize.None
+                    label.Size = UDim2.fromOffset(110, 34)
+                    label.Position = UDim2.new(0, screen.X - 55, 0, screen.Y - 17)
                     label.Parent = gui
                 end
             end
@@ -1089,33 +1629,38 @@ track(RunService.Heartbeat:Connect(function()
 end))
 
 --------------------------------------------------------------------------------
--- FEATURE: FPS boost
+-- FEATURE: FPS boost (client-only)
 --------------------------------------------------------------------------------
-local fpsSweepThread = nil
 local function applyFpsBoost(on)
     if not on then return end
-    if fpsSweepThread and coroutine.status(fpsSweepThread) ~= "dead" then return end
-    safeCall(function()
+    pcall(function()
         Lighting.GlobalShadows = false
-        Lighting.FogEnd = 9e9
-        Lighting.Brightness = 1
+        Lighting.FogEnd = 1e6
+        for _, d in ipairs(Lighting:GetChildren()) do
+            if d:IsA("PostEffect") then d.Enabled = false end
+        end
     end)
-    fpsSweepThread = task.spawn(function()
+    pcall(function() if typeof(setfpscap) == "function" then setfpscap(30) end end)
+end
+
+local fpsThread = nil
+track(RunService.Heartbeat:Connect(function()
+    if SESSION.dead or not Config.FPSBoost then return end
+    if fpsThread and coroutine.status(fpsThread) ~= "dead" then return end
+    fpsThread = task.spawn(function()
         while not SESSION.dead and Config.FPSBoost do
-            safeCall(function()
+            pcall(function()
                 for _, obj in ipairs(Workspace:GetDescendants()) do
-                    if obj:IsA("ParticleEmitter") then
-                        obj.Enabled = false
-                    end
+                    if obj:IsA("ParticleEmitter") then obj.Enabled = false end
                 end
             end)
             task.wait(4)
         end
     end)
-end
+end))
 
 --------------------------------------------------------------------------------
--- GUI  (hand-rolled, touch-safe)
+-- GUI
 --------------------------------------------------------------------------------
 local ACCENT  = Color3.fromRGB(255, 120, 60)
 local PANEL   = Color3.fromRGB(26, 26, 33)
@@ -1128,7 +1673,12 @@ local FONT_B  = Enum.Font.GothamBold
 
 local ScreenGui, MainFrame, NavBar, ContentHolder
 local Pages, NavButtons = {}, {}
-local PageOrder = { "Main", "Steal", "Base", "Shop", "Combat", "Move", "Visual", "Settings" }
+local PageOrder = { "Main", "Steal", "Base", "Train", "Visual", "Settings" }
+local AreaList = {
+    "Forest", "Lake", "Desert", "Jungle", "Snow", "Volcano",
+    "Abyss Ocean", "Prehistoric", "Cosmic", "Cherry Blossom",
+    "Titan Temple",
+}
 
 local function guiParent()
     local parent
@@ -1136,9 +1686,7 @@ local function guiParent()
         if typeof(gethui) == "function" then parent = gethui() end
     end)
     if parent then return parent end
-    pcall(function()
-        parent = game:GetService("CoreGui")
-    end)
+    pcall(function() parent = game:GetService("CoreGui") end)
     if parent then return parent end
     return LocalPlayer:WaitForChild("PlayerGui")
 end
@@ -1195,7 +1743,6 @@ local function buildWindow()
     trackInstance(ScreenGui)
     ScreenGui.Parent = guiParent()
 
-    -- Notification stack lives inside the same ScreenGui ------------------------
     notifyHolder = Instance.new("Frame")
     notifyHolder.Name = "Notices"
     notifyHolder.BackgroundTransparency = 1
@@ -1204,20 +1751,19 @@ local function buildWindow()
     notifyHolder.AnchorPoint = Vector2.new(1, 0)
     notifyHolder.ZIndex = 50
     notifyHolder.Parent = ScreenGui
+    trackInstance(notifyHolder)
     local nAnim = Instance.new("UIListLayout")
     nAnim.Padding = UDim.new(0, 5)
     nAnim.SortOrder = Enum.SortOrder.LayoutOrder
     nAnim.VerticalAlignment = Enum.VerticalAlignment.Bottom
     nAnim.HorizontalAlignment = Enum.HorizontalAlignment.Right
     nAnim.Parent = notifyHolder
-    trackInstance(notifyHolder)
 
     MainFrame = Instance.new("Frame")
     MainFrame.Name = "Root"
     MainFrame.Size = UDim2.fromOffset(560, 384)
     MainFrame.Position = UDim2.new(0.5, -280, 0.5, -192)
     MainFrame.BackgroundColor3 = PANEL
-    MainFrame.BorderSizePixel = 0
     MainFrame.BorderSizePixel = 0
     MainFrame.Parent = ScreenGui
     makeCorner(MainFrame, 12)
@@ -1227,7 +1773,6 @@ local function buildWindow()
     stroke.Transparency = 0.45
     stroke.Parent = MainFrame
 
-    -- Title bar ---------------------------------------------------------------
     local title = Instance.new("Frame")
     title.Name = "TitleBar"
     title.BackgroundColor3 = PANEL2
@@ -1272,13 +1817,12 @@ local function buildWindow()
 
     enableDrag(title, MainFrame)
 
-    -- Mobile scale ------------------------------------------------------------
     local uiScale = Instance.new("UIScale")
     uiScale.Scale = 1
     uiScale.Parent = MainFrame
     trackInstance(uiScale)
     local function fit()
-        safeCall(function()
+        pcall(function()
             local vp = ScreenGui.AbsoluteSize
             local abs = MainFrame.AbsoluteSize
             if vp.X <= 10 or abs.X <= 10 then return end
@@ -1288,7 +1832,6 @@ local function buildWindow()
     track(ScreenGui:GetPropertyChangedSignal("AbsoluteSize"):Connect(fit))
     task.delay(0.3, fit)
 
-    -- Left nav ---------------------------------------------------------------
     NavBar = Instance.new("ScrollingFrame")
     NavBar.Name = "Nav"
     NavBar.BackgroundColor3 = PANEL2
@@ -1305,8 +1848,8 @@ local function buildWindow()
     navList.Parent = NavBar
 
     local icons = {
-        Main = "🏠", Steal = "🥚", Base = "📦", Shop = "🛒",
-        Combat = "⚔️", Move = "🏃", Visual = "👁", Settings = "⚙",
+        Main = "🏠", Steal = "🥚", Base = "📦", Train = "🏃",
+        Visual = "👁", Settings = "⚙",
     }
     for index, name in ipairs(PageOrder) do
         local btn = Instance.new("TextButton")
@@ -1326,7 +1869,6 @@ local function buildWindow()
         btn.MouseButton1Click:Connect(function() selectPage(name) end)
     end
 
-    -- Content ----------------------------------------------------------------
     ContentHolder = Instance.new("Frame")
     ContentHolder.Name = "Content"
     ContentHolder.BackgroundTransparency = 1
@@ -1353,9 +1895,7 @@ local function buildWindow()
     end
 end
 
---------------------------------------------------------------------------------
--- GUI control builders
---------------------------------------------------------------------------------
+-- control builders --------------------------------------------------------------
 local function section(page, label)
     local frame = Instance.new("Frame")
     frame.BackgroundColor3 = CARD
@@ -1419,7 +1959,6 @@ local function addToggle(page, label, key, callback)
         Hub.SaveConfig()
         if callback then safeCall(callback, Config[key]) end
     end)
-    return row
 end
 
 local function addButton(page, text, callback)
@@ -1435,7 +1974,6 @@ local function addButton(page, text, callback)
     btn.Parent = page
     makeCorner(btn, 7)
     btn.MouseButton1Click:Connect(function() safeCall(callback) end)
-    return btn
 end
 
 local function addSlider(page, label, key, minV, maxV, step, callback)
@@ -1477,14 +2015,15 @@ local function addSlider(page, label, key, minV, maxV, step, callback)
     local fill = Instance.new("Frame")
     fill.BorderSizePixel = 0
     fill.BackgroundColor3 = ACCENT
-    fill.Size = UDim2.new(math.clamp(((tonumber(Config[key]) or minV) - minV) / (maxV - minV), 0, 1), 0, 1, 0)
+    fill.Size = UDim2.new(
+        math.clamp(((tonumber(Config[key]) or minV) - minV) / (maxV - minV), 0, 1), 0, 1, 0)
     fill.Parent = bar
     makeCorner(fill, 3)
     local dragging = false
     local function setFromX(x)
         local ratio = math.clamp((x - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1), 0, 1)
         local raw = minV + (maxV - minV) * ratio
-        local val = step and (math.floor(raw / step + 0.5) * step) or raw
+        local val = math.floor(raw / step + 0.5) * step
         Config[key] = val
         value.Text = tostring(val)
         fill.Size = UDim2.new(ratio, 0, 1, 0)
@@ -1508,7 +2047,6 @@ local function addSlider(page, label, key, minV, maxV, step, callback)
     track(UserInputService.InputEnded:Connect(function()
         dragging = false
     end))
-    return row
 end
 
 local function addLabel(page, text)
@@ -1539,156 +2077,127 @@ local function addAreaChips(page)
     for _, area in ipairs(AreaList) do
         local chip = Instance.new("TextButton")
         chip.AutoButtonColor = false
-        chip.BackgroundColor3 = Config.StealAreas[area] and ACCENT or PANEL2
+        chip.BackgroundColor3 = Config.Areas[area] and ACCENT or PANEL2
         chip.Font = FONT
         chip.TextSize = 10
-        chip.TextColor3 = Config.StealAreas[area] and Color3.new(1, 1, 1) or DIM
+        chip.TextColor3 = Config.Areas[area] and Color3.new(1, 1, 1) or DIM
         chip.Text = area
         chip.Parent = holder
         makeCorner(chip, 6)
         chip.MouseButton1Click:Connect(function()
-            if Config.StealAreas[area] then
-                Config.StealAreas[area] = nil
+            if Config.Areas[area] then
+                Config.Areas[area] = nil
             else
-                Config.StealAreas[area] = true
+                Config.Areas[area] = true
             end
-            chip.BackgroundColor3 = Config.StealAreas[area] and ACCENT or PANEL2
-            chip.TextColor3 = Config.StealAreas[area] and Color3.new(1, 1, 1) or DIM
+            chip.BackgroundColor3 = Config.Areas[area] and ACCENT or PANEL2
+            chip.TextColor3 = Config.Areas[area] and Color3.new(1, 1, 1) or DIM
             Hub.SaveConfig()
         end)
     end
 end
 
---------------------------------------------------------------------------------
--- Pages
---------------------------------------------------------------------------------
+-- pages ---------------------------------------------------------------------------
 local function buildPages()
-    local applyFps = applyFpsBoost
-
-    -- MAIN ----------------------------------------------------------------------
-    section(Pages.Main, "Welcome")
-    addLabel(Pages.Main, "Rebuilt, keyless and touch-first. Menu bind: RightShift.")
-    addLabel(Pages.Main, "Recommended start: Auto Steal + Auto Claim + Auto Place + Auto Hatch.")
-    addToggle(Pages.Main, "Auto Steal eggs", "AutoSteal")
-    addToggle(Pages.Main, "Auto claim rewards (offline + codex + perk)", "AutoClaim")
-    addToggle(Pages.Main, "Auto place eggs on your base", "AutoPlace")
-    addToggle(Pages.Main, "Auto hatch placed eggs", "AutoHatch")
-    addToggle(Pages.Main, "Auto sell eggs (by rarity)", "AutoSellEggs")
-    addToggle(Pages.Main, "Auto sell pets (by rarity)", "AutoSellPets")
+    -- MAIN ------------------------------------------------------------------------
+    section(Pages.Main, "State")
+    local statusLabel = addLabel(Pages.Main, "starting...")
+    local lastStatusAt = 0
+    track(RunService.Heartbeat:Connect(function()
+        if os.clock() - lastStatusAt < 0.3 then return end
+        lastStatusAt = os.clock()
+        statusLabel.Text = ("status: %s | walk %.0f | speed %s\nstolen %d  hatched %d  placed %d  sold %d  (loop %d)")
+            :format(tostring(S.status), realWalkSpeed(), short(speedStat()),
+            S.stolen, S.hatched, S.placed, S.sold, S.loops)
+    end))
+    section(Pages.Main, "Quick start")
+    addLabel(Pages.Main, "Run Diagnostics first, then toggle Auto Steal. Guard-unsafe eggs are skipped automatically.")
+    addToggle(Pages.Main, "Auto Steal (walk to egg → carry home)", "AutoSteal")
+    addToggle(Pages.Main, "Auto claim offline earnings", "AutoClaimOffline")
     addButton(Pages.Main, "Diagnostics — report what the hub can see", function()
-        local records = fieldEggs()
-        local inv = getEggInventory()
-        local carry = getRemote("RF/EggWorld/AskFieldEggCarry")
-        Notify("Diagnostics", ("eggs=%s | inventory=%s | carry-remote=%s"):format(
-            records and "OK" or "MISSING",
-            inv and "OK" or "MISSING",
-            carry and "OK" or "MISSING"), "info")
+        local plotOk = resolvePlot()
+        local recs = fieldSnapshotRecords()
+        local n = 0
+        for _, r in pairs(recs) do
+            if type(r) == "table" and r.State == "Slot" then n = n + 1 end
+        end
+        local _, petCount = myPets()
+        local checks = {
+            ("plot=%s pen=%s origin=%s"):format(
+                plotOk and "OK" or "MISSING",
+                S.pen and "OK" or "MISSING",
+                S.origin and "OK" or "MISSING"),
+            ("field-eggs=%d pets=%d"):format(n, petCount),
+            ("guards=%s assets=%s"):format(
+                next(G.Guards) and "OK" or "MISSING",
+                next(G.Assets) and "OK" or "MISSING"),
+            ("mutation-mod=%s"):format(G.Mutations and "OK" or "MISSING"),
+            ("walk-speed=%.0f treadmill=%s"):format(realWalkSpeed(), S.tread and "OK" or "MISSING"),
+        }
+        Notify("Diagnostics", table.concat(checks, " | "), "info")
     end)
+    addLabel(Pages.Main, "Movement is real walking only — the server-safe way. Optional fast mode is opt-in.")
 
-    -- STEAL ---------------------------------------------------------------------
+    -- STEAL -----------------------------------------------------------------------
     addAreaChips(Pages.Steal)
     section(Pages.Steal, "Targeting")
-    addSlider(Pages.Steal, "Movement speed (studs/s)", "StealSpeed", 16, 160, 1, function(v)
-        applyMovement(v)
-    end)
-    addToggle(Pages.Steal, "Teleport mode (risky, instant)", "StealTeleport")
-    addLabel(Pages.Steal, "Priority: Rarest → highest rarity first (fallback: nearest).")
-    addButton(Pages.Steal, "Steal once now", function()
-        local target = pickTarget()
-        if not target then
-            Notify("Steal", "No egg matched the current filters.", "error")
-            return
-        end
-        local uid = target.Uid or target.UID
-        local pos = eggPositionOf(target)
-        if Config.StealTeleport then
-            teleportTo(pos)
-        else
-            walkTo(pos, Config.StealSpeed, 30)
-        end
-        task.wait(0.2)
-        if tryPickup(uid) then
-            Notify("Steal", "Picked up — placing/heading home.", "success")
-            returnHome()
-            if Config.AutoPlace then
-                safeCall(function()
-                    callRemote("RF/EggWorld/AskPlaceEgg", false, { Uid = uid })
-                end)
-            end
-        else
-            lastAttempt[uid] = os.clock() + 2
-            Notify("Steal", "Pickup failed — retrying later.", "error")
-        end
-    end)
+    addToggle(Pages.Steal, "Prefer richest egg (else nearest)", "PreferBest")
+    addSlider(Pages.Steal, "Min income floor (% of your best pet)", "MinRatePct", 0, 8, 1)
+    addSlider(Pages.Steal, "Eggs per outing", "ChainGrab", 1, 8, 1)
+    section(Pages.Steal, "Delivery")
+    addToggle(Pages.Steal, "Auto place carried egg in pen", "AutoPlace")
+    section(Pages.Steal, "Speed (advanced — leave OFF until stable)")
+    addToggle(Pages.Steal, "Fast mode (bound to 2x your real walk speed)", "FastMode")
+    addLabel(Pages.Steal, "Fast mode never anchors and slows to plain walking automatically if the game pushes you back.")
 
-    -- BASE ----------------------------------------------------------------------
-    section(Pages.Base, "Base automation")
-    addToggle(Pages.Base, "Auto upgrade base tiers", "AutoBaseUp")
-    addToggle(Pages.Base, "Auto treadmill (walk + sit + train)", "AutoTreadmill")
-    addToggle(Pages.Base, "Auto equip best pets", "AutoEquipBest")
-    section(Pages.Base, "Selling")
-    addSlider(Pages.Base, "Sell up to rarity index (1=Common … 9=Eternal)", "SellMaxRarity", 1, 9, 1)
-    addButton(Pages.Base, "Sell eggs once", function()
-        local count = sellPass()
-        Notify("Sell", ("Sold %d egg(s)."):format(count), "success")
-    end)
-    addButton(Pages.Base, "Sell pets once", function()
-        local count = sellPetsPass()
-        Notify("Sell", ("Sold %d pet(s)."):format(count), "success")
-    end)
+    -- BASE ------------------------------------------------------------------------
+    section(Pages.Base, "Automation")
+    addToggle(Pages.Base, "Auto place eggs", "AutoPlace")
+    addToggle(Pages.Base, "Auto hatch ready eggs", "AutoHatch")
+    addToggle(Pages.Base, "Auto equip pets from backpack", "AutoEquip")
+    addToggle(Pages.Base, "Auto sell (when the pen is full)", "AutoSell")
+    addToggle(Pages.Base, "Also sell worse backpack pets", "SellBackpack")
+    addLabel(Pages.Base, "Selling keeps your best pets and replaces the worst when something better arrives.")
 
-    -- SHOP ----------------------------------------------------------------------
-    section(Pages.Shop, "Spending")
-    addToggle(Pages.Shop, "Auto buy trail (affordable)", "AutoBuyTrail")
-    addLabel(Pages.Shop, "Purchases are rate-limited to one attempt every 6 seconds.")
+    -- TRAIN -----------------------------------------------------------------------
+    section(Pages.Train, "Get faster the legit way")
+    addLabel(Pages.Train, "This game raises your Speed by running on your own treadmill. More Speed = safer zones.")
+    addToggle(Pages.Train, "Train when too slow (auto detect)", "AutoTrain")
+    addSlider(Pages.Train, "Seconds per training run", "TreadmillSeconds", 5, 60, 5)
+    section(Pages.Train, "Upgrades (spends real cash)")
+    addToggle(Pages.Train, "Auto upgrade treadmill", "AutoUpTreadmill")
+    addLabel(Pages.Train, "Price cap below: 0 = no cap. 6 = max $9.99M, 9 = max $0.99B, 12 = max $0.99T.")
+    addSlider(Pages.Train, "Max price cap exponent (0=off)", "MaxTreadmillPrice", 0, 15, 1)
 
-    -- COMBAT --------------------------------------------------------------------
-    section(Pages.Combat, "Combat")
-    addToggle(Pages.Combat, "Bat aura (slap nearby players)", "BatAura")
-    addSlider(Pages.Combat, "Bat aura radius", "BatRadius", 6, 40, 1)
-    addButton(Pages.Combat, "Slap now", swingBat)
-    addToggle(Pages.Combat, "Guard strike aura", "GuardAura")
-    addToggle(Pages.Combat, "Defend my base", "DefendEgg")
-    addLabel(Pages.Combat, "Anti-ragdoll patches re-apply automatically on respawn.")
-
-    -- MOVE ----------------------------------------------------------------------
-    section(Pages.Move, "Movement")
-    addSlider(Pages.Move, "WalkSpeed", "WalkSpeed", 16, 350, 1, applyMovement)
-    addSlider(Pages.Move, "JumpPower", "JumpPower", 50, 350, 1, function(v)
-        local hum = findHumanoid()
-        if hum then
-            safeCall(function()
-                hum.JumpPower = v
-                hum.UseJumpPower = true
-            end)
-        end
-    end)
-    addToggle(Pages.Move, "Infinite jump", "InfJump")
-    addToggle(Pages.Move, "NoClip", "Noclip")
-    addToggle(Pages.Move, "Anti AFK", "AntiAFK")
-
-    -- VISUAL --------------------------------------------------------------------
+    -- VISUAL ----------------------------------------------------------------------
     section(Pages.Visual, "Egg ESP")
     addToggle(Pages.Visual, "Egg ESP", "EggESP")
     addSlider(Pages.Visual, "ESP render distance", "ESPDistance", 50, 800, 10)
     section(Pages.Visual, "Performance")
-    addToggle(Pages.Visual, "FPS boost", "FPSBoost", applyFps)
+    addToggle(Pages.Visual, "FPS boost", "FPSBoost", applyFpsBoost)
     addLabel(Pages.Visual, "FPS boost removes particles every 4s and clears shadows.")
 
-    -- SETTINGS ------------------------------------------------------------------
+    -- SETTINGS --------------------------------------------------------------------
     section(Pages.Settings, "Config")
     addLabel(Pages.Settings, "Config auto-saves to GabHub_SAE.json after every change.")
     addButton(Pages.Settings, "Save config now", function()
         Hub.SaveConfig()
         Notify("Config", "Saved.", "success")
     end)
-    addButton(Pages.Settings, "Re-run anti-detection bypass", function()
-        local count, why = bypassDetections()
-        if count and count > 0 then
-            Notify("Stealth", ("Bypass applied: %d detector state(s) frozen."):format(count), "success")
-        else
-            Notify("Stealth", "Bypass not applied — " .. tostring(why), "error")
+    addButton(Pages.Settings, "Safety mode: all features OFF + save", function()
+        for _, key in ipairs({
+            "AutoSteal", "AutoPlace", "AutoHatch", "AutoEquip", "AutoSell",
+            "AutoClaimOffline", "AutoTrain", "AutoUpTreadmill", "FastMode",
+        }) do
+            Config[key] = false
         end
+        stopNavigation()
+        Hub.SaveConfig()
+        Notify("Config", "All features OFF (idling safe).", "success")
+    end)
+    addButton(Pages.Settings, "Release movement (un-stick character)", function()
+        stopNavigation()
+        Notify("Movement", "Controls returned to you.", "success")
     end)
     addButton(Pages.Settings, "Reset to defaults", function()
         local keybind = Config.Keybind
@@ -1699,7 +2208,7 @@ local function buildPages()
                 Config[key] = value
             end
         end
-        Config.Keybind = keybind
+        Config.Keybind = keybind or Defaults.Keybind
         Hub.SaveConfig()
         Notify("Config", "Defaults restored (keybind kept).", "info")
     end)
@@ -1710,7 +2219,7 @@ local function buildPages()
     addLabel(Pages.Settings, "github.com/Inkflow-Gab")
 end
 
--- Keybind -------------------------------------------------------------------------
+-- keybind ------------------------------------------------------------------------
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
     local wanted = Config.Keybind or "RightShift"
@@ -1742,16 +2251,30 @@ end
 buildWindow()
 buildPages()
 selectPage("Main")
-Notify("Gab Hub", ("Loaded v%s — Steal An Egg."):format(Hub.Version), "success")
+Notify("Gab Hub", ("Loaded v%s — Steal An Egg (BAC-safe)."):format(Hub.Version), "success")
 
--- Neutralize the game's client-side detection before any automation can run
 task.spawn(function()
-    task.wait(0.5)
-    local count, why = bypassDetections()
-    if count and count > 0 then
-        Notify("Stealth", ("Anti-detection bypass active (%d frozen)."):format(count), "success")
+    repeat task.wait() until game:IsLoaded()
+    task.wait(1)
+
+    installAntiKick()
+    guardCharacter(LocalPlayer.Character)
+    wireCarryState()
+    wireResetCountdown()
+
+    -- wait for our plot before starting any automation
+    local t0 = os.clock()
+    while not SESSION.dead and not resolvePlot() and os.clock() - t0 < 45 do
+        S.status = "waiting for your plot"
+        task.wait(1)
+    end
+    if not S.plot then
+        S.status = "plot not found"
+        Notify("Gab Hub", "Your plot could not be located — features are paused.", "error")
     else
-        Notify("Stealth", "Bypass unavailable — " .. tostring(why), "error")
+        claimOffline()
+        spawnLoop(mainCycle)
+        Notify("Gab Hub", "Plot found — engine running. Toggle features to act.", "success")
     end
 end)
 
